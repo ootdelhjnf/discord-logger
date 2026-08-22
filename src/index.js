@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { createVerification, handleVerify, pendingCount } from './verify.js';
+import { buildLiveMessage } from './live.js';
 import {
   buildPanel,
   buildModal,
@@ -31,6 +32,8 @@ const VERIFY_ENABLED = process.env.VERIFY_ENABLED === 'true';
 const KICK_SLUG = process.env.KICK_SLUG;
 const KICK_COUNTER_CHANNEL_ID = process.env.KICK_COUNTER_CHANNEL_ID;
 const KICK_REFRESH_MS = 10 * 60 * 1000;
+const LIVE_CHANNEL_ID = process.env.LIVE_CHANNEL_ID;
+let liveMessageId = null;
 const TICKET_CONFIG = {
   categoryId: process.env.TICKET_CATEGORY_ID,
   archiveCategoryId: process.env.TICKET_ARCHIVE_CATEGORY_ID,
@@ -440,6 +443,42 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
 let kickState = { followers: null, live: false, name: null, updatedAt: null };
 
+async function updateLiveMessage(data) {
+  if (!LIVE_CHANNEL_ID) return;
+
+  const channel = await client.channels.fetch(LIVE_CHANNEL_ID).catch(() => null);
+  if (!channel) {
+    console.error('Canale live non trovato');
+    return;
+  }
+
+  const payload = buildLiveMessage(data, KICK_SLUG);
+
+  if (!liveMessageId) {
+    const recent = await channel.messages.fetch({ limit: 20 }).catch(() => null);
+    const mine = recent?.find((m) => m.author.id === client.user.id && m.embeds.length);
+    if (mine) liveMessageId = mine.id;
+  }
+
+  if (liveMessageId) {
+    const existing = await channel.messages.fetch(liveMessageId).catch(() => null);
+    if (existing) {
+      await existing.edit(payload).catch((err) => console.error('Aggiornamento live fallito:', err.message));
+      return;
+    }
+    liveMessageId = null;
+  }
+
+  const sent = await channel.send(payload).catch((err) => {
+    console.error('Invio messaggio live fallito:', err.message);
+    return null;
+  });
+  if (sent) {
+    liveMessageId = sent.id;
+    console.log(`messaggio live creato: ${sent.id}`);
+  }
+}
+
 const KICK_ENDPOINTS = [
   (slug) => `https://kick.com/api/v2/channels/${slug}`,
   (slug) => `https://kick.com/api/v1/channels/${slug}`,
@@ -501,6 +540,7 @@ async function updateKickCounter() {
   }
 
   const { data: raw, followers } = data;
+  await updateLiveMessage(raw);
 
   const live = Boolean(raw.livestream ?? raw.stream?.is_live);
   const name = `${live ? '🔴' : '🟢'}・𝗞𝗜𝗖𝗞: ${followers.toLocaleString('en-US')}`;
@@ -908,7 +948,13 @@ createServer(async (req, res) => {
       verifyEnabled: VERIFY_ENABLED,
       verifyPending: pendingCount(),
       kick: KICK_SLUG
-        ? { slug: KICK_SLUG, followers: kickState.followers, live: kickState.live, updatedAt: kickState.updatedAt }
+        ? {
+            slug: KICK_SLUG,
+            followers: kickState.followers,
+            live: kickState.live,
+            updatedAt: kickState.updatedAt,
+            liveMessageId,
+          }
         : null,
     }),
   );
