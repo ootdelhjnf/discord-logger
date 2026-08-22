@@ -25,6 +25,8 @@ import {
   ButtonStyle,
   AuditLogEvent,
   MessageFlags,
+  ChannelType,
+  PermissionFlagsBits,
   time,
 } from 'discord.js';
 
@@ -38,7 +40,12 @@ const KICK_SLUG = process.env.KICK_SLUG;
 const KICK_COUNTER_CHANNEL_ID = process.env.KICK_COUNTER_CHANNEL_ID;
 const KICK_REFRESH_MS = Number(process.env.KICK_REFRESH_MS) || 3 * 60 * 1000;
 const LIVE_CHANNEL_ID = process.env.LIVE_CHANNEL_ID;
-const LIVE_ANNOUNCE_CHANNEL_ID = process.env.LIVE_ANNOUNCE_CHANNEL_ID || LIVE_CHANNEL_ID;
+const LIVE_ANNOUNCE_CHANNEL_ID = process.env.LIVE_ANNOUNCE_CHANNEL_ID;
+const LIVE_ANNOUNCE_CHANNEL_NAME = process.env.LIVE_ANNOUNCE_CHANNEL_NAME || 'live-alerts';
+const LIVE_ANNOUNCE_CATEGORY_ID = process.env.LIVE_ANNOUNCE_CATEGORY_ID;
+const LIVE_ANNOUNCE_AUTOCREATE = process.env.LIVE_ANNOUNCE_AUTOCREATE !== 'false';
+const LIVE_ANNOUNCE_LOCK = process.env.LIVE_ANNOUNCE_LOCK !== 'false';
+let announceChannelId = null;
 const LIVE_PING_ROLE_ID = process.env.LIVE_PING_ROLE_ID;
 const LIVE_ANNOUNCE_MENTION = (process.env.LIVE_ANNOUNCE_MENTION || 'everyone').toLowerCase();
 const LIVE_ANNOUNCE_COOLDOWN_MS = (Number(process.env.LIVE_ANNOUNCE_COOLDOWN_MIN) || 60) * 60 * 1000;
@@ -236,13 +243,14 @@ client.once('clientReady', async () => {
   }
   console.log(`Intent membri OK — ${members.size} membri in cache. Logger attivo.`);
 
-  if (KICK_SLUG && (KICK_COUNTER_CHANNEL_ID || LIVE_CHANNEL_ID || LIVE_ANNOUNCE_CHANNEL_ID)) {
+  if (KICK_SLUG) {
+    await ensureAnnounceChannel(guild);
     trackAnnouncements((await readLiveState()).messages);
     await pollKick();
     setInterval(pollKick, KICK_REFRESH_MS);
     console.log(`Monitor Kick attivo su ${KICK_SLUG}, controllo ogni ${KICK_REFRESH_MS / 60000} minuti`);
-    if (LIVE_ANNOUNCE_CHANNEL_ID) {
-      console.log(`Annuncio live nel canale ${LIVE_ANNOUNCE_CHANNEL_ID} con ping ${liveMention() || 'disattivato'}`);
+    if (announceChannelId) {
+      console.log(`Annunci live in <#${announceChannelId}> con ping ${liveMention() || 'disattivato'}`);
     }
   }
 });
@@ -512,6 +520,86 @@ function liveAllowedMentions() {
   return { parse: ['everyone'] };
 }
 
+async function lockAnnounceChannel(channel) {
+  if (!LIVE_ANNOUNCE_LOCK) return;
+  const me = await channel.guild.members.fetchMe().catch(() => null);
+  if (!me?.permissions.has(PermissionFlagsBits.ManageChannels)) return;
+
+  await channel.permissionOverwrites
+    .edit(channel.guild.id, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: false,
+      AddReactions: false,
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      SendMessagesInThreads: false,
+    }, { reason: 'Canale annunci live in sola lettura' })
+    .catch((err) => console.error('Blocco canale annunci fallito:', err.message));
+
+  await channel.permissionOverwrites
+    .edit(me.id, {
+      ViewChannel: true,
+      SendMessages: true,
+      EmbedLinks: true,
+      ManageMessages: true,
+      MentionEveryone: true,
+    }, { reason: 'Permessi bot canale annunci live' })
+    .catch(() => null);
+}
+
+async function ensureAnnounceChannel(guild) {
+  if (LIVE_ANNOUNCE_CHANNEL_ID) {
+    const configured = await guild.channels.fetch(LIVE_ANNOUNCE_CHANNEL_ID).catch(() => null);
+    if (configured) {
+      announceChannelId = configured.id;
+      await lockAnnounceChannel(configured);
+      return;
+    }
+    console.error('LIVE_ANNOUNCE_CHANNEL_ID non valido:', LIVE_ANNOUNCE_CHANNEL_ID);
+  }
+
+  if (!LIVE_ANNOUNCE_AUTOCREATE) {
+    announceChannelId = LIVE_CHANNEL_ID ?? null;
+    return;
+  }
+
+  const state = await readLiveState();
+  let channel = state.announceChannelId
+    ? await guild.channels.fetch(state.announceChannelId).catch(() => null)
+    : null;
+
+  if (!channel) {
+    const all = await guild.channels.fetch().catch(() => null);
+    channel = all?.find((c) => c?.type === ChannelType.GuildText && c.name === LIVE_ANNOUNCE_CHANNEL_NAME) ?? null;
+  }
+
+  if (!channel) {
+    channel = await guild.channels
+      .create({
+        name: LIVE_ANNOUNCE_CHANNEL_NAME,
+        type: ChannelType.GuildText,
+        parent: LIVE_ANNOUNCE_CATEGORY_ID || undefined,
+        topic: `Automatic notifications when ${KICK_SLUG} goes live on Kick`,
+        reason: 'Canale dedicato agli annunci live',
+      })
+      .catch((err) => {
+        console.error('Creazione canale annunci fallita:', err.message);
+        return null;
+      });
+    if (channel) console.log(`canale annunci live creato: #${channel.name} (${channel.id})`);
+  }
+
+  if (!channel) {
+    announceChannelId = LIVE_CHANNEL_ID ?? null;
+    return;
+  }
+
+  await lockAnnounceChannel(channel);
+  announceChannelId = channel.id;
+  if (state.announceChannelId !== channel.id) await writeLiveState({ announceChannelId: channel.id });
+}
+
 function trackAnnouncements(refs) {
   liveAnnouncementIds.clear();
   for (const ref of refs ?? []) liveAnnouncementIds.add(ref.id);
@@ -544,9 +632,9 @@ async function pruneAnnouncements(all = false) {
 }
 
 async function sendAnnouncement(raw, sessionId, reminder) {
-  const channel = await client.channels.fetch(LIVE_ANNOUNCE_CHANNEL_ID).catch(() => null);
+  const channel = await client.channels.fetch(announceChannelId).catch(() => null);
   if (!channel?.isTextBased()) {
-    console.error('Canale annuncio live non trovato:', LIVE_ANNOUNCE_CHANNEL_ID);
+    console.error('Canale annuncio live non trovato:', announceChannelId);
     return;
   }
 
@@ -588,7 +676,7 @@ async function sendAnnouncement(raw, sessionId, reminder) {
 }
 
 async function announceLive(raw) {
-  if (!LIVE_ANNOUNCE_CHANNEL_ID) return;
+  if (!announceChannelId) return;
 
   const stream = raw.livestream;
   const state = await readLiveState();
