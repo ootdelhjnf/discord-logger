@@ -15,6 +15,8 @@ import {
   TICKET_TYPES,
 } from './tickets.js';
 import { getTicket, markClosed, markDeleted } from './ticketStore.js';
+import { startCodeStream, buildCodeMessage, expiredCodeMessage } from './codes.js';
+import { getCodesState, setCodesChannel, filterNewCodes, markSeen, addPosted, takeExpiredPosts } from './codesStore.js';
 import {
   Client,
   GatewayIntentBits,
@@ -57,6 +59,22 @@ const liveAnnouncementIds = new Set();
 const RENAME_MIN_INTERVAL_MS = 10 * 60 * 1000;
 let liveMessageId = null;
 let lastRenameAt = 0;
+const CODES_ENABLED = process.env.CODES_ENABLED !== 'false';
+const CODES_BRANDS = (process.env.CODES_BRANDS || 'shuffle,shuffleus')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const CODES_CHANNEL_ID = process.env.CODES_CHANNEL_ID;
+const CODES_CHANNEL_NAME = process.env.CODES_CHANNEL_NAME || 'code-drops';
+const CODES_CATEGORY_ID = process.env.CODES_CATEGORY_ID;
+const CODES_PING_ROLE_ID = process.env.CODES_PING_ROLE_ID;
+const CODES_MENTION = (process.env.CODES_MENTION || 'role').toLowerCase();
+const CODES_MIN_VALUE = Number(process.env.CODES_MIN_VALUE) || 0;
+const CODES_REDEEM_URL = process.env.CODES_REDEEM_URL || 'https://shuffle.com';
+const CODES_TOPIC = 'Automatic Shuffle code drops from fairgambling.com/livecodes';
+let codesChannelId = null;
+const codeMessageIds = new Set();
+
 const TICKET_CONFIG = {
   categoryId: process.env.TICKET_CATEGORY_ID,
   archiveCategoryId: process.env.TICKET_ARCHIVE_CATEGORY_ID,
@@ -251,6 +269,21 @@ client.once('clientReady', async () => {
     console.log(`Monitor Kick attivo su ${KICK_SLUG}, controllo ogni ${KICK_REFRESH_MS / 60000} minuti`);
     if (announceChannelId) {
       console.log(`Annunci live in <#${announceChannelId}> con ping ${liveMention() || 'disattivato'}`);
+    }
+  }
+
+  if (CODES_ENABLED) {
+    await ensureCodesChannel(guild);
+    if (codesChannelId) {
+      const state = await getCodesState();
+      for (const post of state.posted ?? []) codeMessageIds.add(post.id);
+      await sweepExpiredCodes();
+      setInterval(() => sweepExpiredCodes().catch(() => null), 60_000).unref?.();
+      startCodeStream({
+        onCodes: (codes) => handleIncomingCodes(codes).catch((err) => console.error('Gestione codici fallita:', err.message)),
+        onLog: (msg) => console.log(`[codes] ${msg}`),
+      });
+      console.log(`Code drops attivi in <#${codesChannelId}> per: ${CODES_BRANDS.join(', ')}`);
     }
   }
 });
@@ -524,7 +557,7 @@ function liveTopic() {
   return `Automatic notifications when ${KICK_SLUG} goes live on Kick`;
 }
 
-async function lockAnnounceChannel(channel) {
+async function lockReadOnlyChannel(channel) {
   if (!LIVE_ANNOUNCE_LOCK) return;
   const me = await channel.guild.members.fetchMe().catch(() => null);
   if (!me?.permissions.has(PermissionFlagsBits.ManageChannels)) return;
@@ -557,7 +590,7 @@ async function ensureAnnounceChannel(guild) {
     const configured = await guild.channels.fetch(LIVE_ANNOUNCE_CHANNEL_ID).catch(() => null);
     if (configured) {
       announceChannelId = configured.id;
-      await lockAnnounceChannel(configured);
+      await lockReadOnlyChannel(configured);
       return;
     }
     console.error('LIVE_ANNOUNCE_CHANNEL_ID non valido:', LIVE_ANNOUNCE_CHANNEL_ID);
@@ -602,7 +635,7 @@ async function ensureAnnounceChannel(guild) {
     return;
   }
 
-  await lockAnnounceChannel(channel);
+  await lockReadOnlyChannel(channel);
   announceChannelId = channel.id;
   if (state.announceChannelId !== channel.id) await writeLiveState({ announceChannelId: channel.id });
 }
@@ -718,6 +751,122 @@ async function announceLive(raw) {
     return;
   }
   if (!state.live) await writeLiveState({ live: true });
+}
+
+async function ensureCodesChannel(guild) {
+  if (!CODES_ENABLED) return;
+
+  if (CODES_CHANNEL_ID) {
+    const configured = await guild.channels.fetch(CODES_CHANNEL_ID).catch(() => null);
+    if (configured) {
+      codesChannelId = configured.id;
+      await lockReadOnlyChannel(configured);
+      return;
+    }
+    console.error('CODES_CHANNEL_ID non valido:', CODES_CHANNEL_ID);
+  }
+
+  const state = await getCodesState();
+  let channel = state.channelId ? await guild.channels.fetch(state.channelId).catch(() => null) : null;
+
+  if (!channel) {
+    const all = await guild.channels.fetch().catch(() => null);
+    channel = all?.find(
+      (c) => c?.type === ChannelType.GuildText && (c.name === CODES_CHANNEL_NAME || c.topic === CODES_TOPIC),
+    ) ?? null;
+  }
+
+  if (!channel) {
+    channel = await guild.channels
+      .create({
+        name: CODES_CHANNEL_NAME,
+        type: ChannelType.GuildText,
+        parent: CODES_CATEGORY_ID || undefined,
+        topic: CODES_TOPIC,
+        reason: 'Canale dedicato ai code drop',
+      })
+      .catch((err) => {
+        console.error('Creazione canale codici fallita:', err.message);
+        return null;
+      });
+    if (channel) console.log(`canale code drops creato: #${channel.name} (${channel.id})`);
+  }
+
+  if (!channel) return;
+  await lockReadOnlyChannel(channel);
+  codesChannelId = channel.id;
+  await setCodesChannel(channel.id);
+}
+
+function codesMention() {
+  if (CODES_PING_ROLE_ID) return `<@&${CODES_PING_ROLE_ID}>`;
+  if (CODES_MENTION === 'everyone') return '@everyone';
+  if (CODES_MENTION === 'here') return '@here';
+  return '';
+}
+
+function codesAllowedMentions() {
+  if (CODES_PING_ROLE_ID) return { roles: [CODES_PING_ROLE_ID], parse: [] };
+  if (CODES_MENTION === 'everyone' || CODES_MENTION === 'here') return { parse: ['everyone'] };
+  return { parse: [] };
+}
+
+async function postCode(entry) {
+  const channel = await client.channels.fetch(codesChannelId).catch(() => null);
+  if (!channel?.isTextBased()) return;
+
+  const payload = buildCodeMessage(entry, {
+    mention: codesMention(),
+    redeemUrl: CODES_REDEEM_URL,
+    pingRoleId: CODES_PING_ROLE_ID,
+  });
+
+  const sent = await channel
+    .send({ ...payload, allowedMentions: codesAllowedMentions() })
+    .catch((err) => {
+      console.error('Invio code drop fallito:', err.message);
+      return null;
+    });
+  if (!sent) return;
+
+  codeMessageIds.add(sent.id);
+  await addPosted({ channelId: sent.channelId, id: sent.id, endAt: entry.endAt, entry });
+  console.log(`code drop pubblicato: ${entry.casino} ${entry.code} ($${entry.value})`);
+
+  if (entry.endAt && entry.endAt > Date.now()) {
+    setTimeout(() => {
+      sweepExpiredCodes().catch(() => null);
+    }, entry.endAt - Date.now() + 2000).unref?.();
+  }
+}
+
+async function sweepExpiredCodes() {
+  const expired = await takeExpiredPosts();
+  for (const post of expired) {
+    const channel = await client.channels.fetch(post.channelId).catch(() => null);
+    const message = await channel?.messages?.fetch(post.id).catch(() => null);
+    if (!message) continue;
+    await message
+      .edit({ ...expiredCodeMessage(post.entry, { redeemUrl: CODES_REDEEM_URL }), allowedMentions: { parse: [] } })
+      .catch(() => null);
+  }
+}
+
+async function handleIncomingCodes(codes) {
+  if (!codesChannelId) return;
+  const wanted = codes.filter(
+    (c) => CODES_BRANDS.includes(c.slug) && c.value >= CODES_MIN_VALUE,
+  );
+  const others = codes.filter((c) => !wanted.includes(c));
+  if (others.length) await markSeen(others);
+  if (!wanted.length) return;
+
+  const fresh = await filterNewCodes(wanted);
+  const live = fresh
+    .filter((c) => !c.endAt || c.endAt > Date.now())
+    .sort((a, b) => a.createdAt - b.createdAt);
+
+  for (const entry of live) await postCode(entry);
 }
 
 const KICK_ENDPOINTS = [
@@ -1194,25 +1343,28 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ ...payload, ephemeral: true });
       return;
     }
-    if (interaction.isButton() && interaction.customId === 'live_notify_toggle') {
-      if (!LIVE_PING_ROLE_ID) {
-        await interaction.reply({ content: 'Live notifications are not configured.', ephemeral: true });
+    if (interaction.isButton() && (interaction.customId === 'live_notify_toggle' || interaction.customId === 'codes_notify_toggle')) {
+      const isCodes = interaction.customId === 'codes_notify_toggle';
+      const roleId = isCodes ? CODES_PING_ROLE_ID : LIVE_PING_ROLE_ID;
+      if (!roleId) {
+        await interaction.reply({ content: 'These notifications are not configured.', ephemeral: true });
         return;
       }
-      const hasRole = interaction.member.roles.cache.has(LIVE_PING_ROLE_ID);
+      const hasRole = interaction.member.roles.cache.has(roleId);
       try {
-        if (hasRole) await interaction.member.roles.remove(LIVE_PING_ROLE_ID, 'Live notifications off');
-        else await interaction.member.roles.add(LIVE_PING_ROLE_ID, 'Live notifications on');
+        if (hasRole) await interaction.member.roles.remove(roleId, 'Notifiche disattivate');
+        else await interaction.member.roles.add(roleId, 'Notifiche attivate');
       } catch (err) {
         await interaction.reply({ content: `Could not update your role: ${err.message}`, ephemeral: true });
         return;
       }
-      await interaction.reply({
-        content: hasRole
-          ? '🔕 You will no longer be pinged when the stream starts.'
-          : '🔔 You will be pinged every time the stream starts.',
-        ephemeral: true,
-      });
+      const on = isCodes
+        ? '🔔 You will be pinged on every new code drop.'
+        : '🔔 You will be pinged every time the stream starts.';
+      const off = isCodes
+        ? '🔕 You will no longer be pinged on code drops.'
+        : '🔕 You will no longer be pinged when the stream starts.';
+      await interaction.reply({ content: hasRole ? off : on, ephemeral: true });
       return;
     }
 
@@ -1275,8 +1427,8 @@ createServer(async (req, res) => {
 
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot) return;
-  const onAnnouncement = liveAnnouncementIds.has(reaction.message.id);
-  if (!onAnnouncement && !NO_REACTION_CHANNELS.includes(reaction.message.channelId)) return;
+  const onBotFeed = liveAnnouncementIds.has(reaction.message.id) || codeMessageIds.has(reaction.message.id);
+  if (!onBotFeed && !NO_REACTION_CHANNELS.includes(reaction.message.channelId)) return;
 
   try {
     if (reaction.partial) await reaction.fetch();
