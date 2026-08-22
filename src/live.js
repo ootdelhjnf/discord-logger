@@ -20,6 +20,59 @@ function categoryName(data) {
   );
 }
 
+function streamStartedAt(live) {
+  const raw = live?.start_time ?? live?.created_at;
+  const ms = raw ? Date.parse(String(raw).replace(' ', 'T') + (String(raw).endsWith('Z') ? '' : 'Z')) : NaN;
+  return Number.isNaN(ms) ? Date.now() : ms;
+}
+
+export function buildLiveAnnouncement(data, slug, { mention = '', pingRoleId = null } = {}) {
+  const url = `https://kick.com/${slug}`;
+  const live = data.livestream;
+  const displayName = data.user?.username ?? slug;
+  const avatar = data.user?.profile_pic ?? null;
+  const startedAt = streamStartedAt(live);
+
+  const embed = new EmbedBuilder()
+    .setColor(0xff3131)
+    .setAuthor({ name: displayName, url, iconURL: avatar ?? undefined })
+    .setTitle(`🔴 ${displayName} is LIVE on Kick!`.slice(0, 250))
+    .setURL(url)
+    .setDescription(
+      [
+        live?.session_title ? `**${live.session_title}**` : '**The stream just started.**',
+        '',
+        'Jump in now, chat with us and do not miss the drops and the giveaways.',
+      ].join('\n'),
+    )
+    .addFields({ name: 'Started', value: `<t:${Math.floor(startedAt / 1000)}:R>`, inline: true });
+
+  const cat = categoryName(data);
+  if (cat) embed.addFields({ name: 'Category', value: cat, inline: true });
+  if (typeof data.followers_count === 'number') {
+    embed.addFields({ name: 'Followers', value: data.followers_count.toLocaleString('en-US'), inline: true });
+  }
+
+  const thumb = pickThumbnail(data);
+  if (thumb) embed.setImage(thumb);
+  embed.setFooter({ text: 'Kick live notification' }).setTimestamp(new Date());
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Watch the stream').setEmoji('🔴').setURL(url),
+  );
+  if (pingRoleId) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('live_notify_toggle')
+        .setStyle(ButtonStyle.Secondary)
+        .setLabel('Notify me / stop notifying me')
+        .setEmoji('🔔'),
+    );
+  }
+
+  return { content: mention || undefined, embeds: [embed], components: [row] };
+}
+
 export function buildLiveMessage(data, slug) {
   const url = `https://kick.com/${slug}`;
   const live = data.livestream;
@@ -56,7 +109,7 @@ export function buildLiveMessage(data, slug) {
 
   const thumb = pickThumbnail(data);
   if (thumb) embed.setImage(thumb);
-  embed.setFooter({ text: 'Updates automatically every 10 minutes' });
+  embed.setFooter({ text: 'Updated automatically' });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()

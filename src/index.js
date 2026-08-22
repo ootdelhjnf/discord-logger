@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { createVerification, handleVerify, pendingCount } from './verify.js';
-import { buildLiveMessage } from './live.js';
+import { buildLiveMessage, buildLiveAnnouncement } from './live.js';
+import { readLiveState, writeLiveState } from './liveState.js';
 import {
   buildPanel,
   buildModal,
@@ -35,9 +36,15 @@ const VERIFIED_ROLE_ID = process.env.VERIFIED_ROLE_ID;
 const VERIFY_ENABLED = process.env.VERIFY_ENABLED === 'true';
 const KICK_SLUG = process.env.KICK_SLUG;
 const KICK_COUNTER_CHANNEL_ID = process.env.KICK_COUNTER_CHANNEL_ID;
-const KICK_REFRESH_MS = 10 * 60 * 1000;
+const KICK_REFRESH_MS = Number(process.env.KICK_REFRESH_MS) || 3 * 60 * 1000;
 const LIVE_CHANNEL_ID = process.env.LIVE_CHANNEL_ID;
+const LIVE_ANNOUNCE_CHANNEL_ID = process.env.LIVE_ANNOUNCE_CHANNEL_ID || LIVE_CHANNEL_ID;
+const LIVE_PING_ROLE_ID = process.env.LIVE_PING_ROLE_ID;
+const LIVE_ANNOUNCE_MENTION = (process.env.LIVE_ANNOUNCE_MENTION || 'everyone').toLowerCase();
+const LIVE_ANNOUNCE_COOLDOWN_MS = (Number(process.env.LIVE_ANNOUNCE_COOLDOWN_MIN) || 60) * 60 * 1000;
+const RENAME_MIN_INTERVAL_MS = 10 * 60 * 1000;
 let liveMessageId = null;
+let lastRenameAt = 0;
 const TICKET_CONFIG = {
   categoryId: process.env.TICKET_CATEGORY_ID,
   archiveCategoryId: process.env.TICKET_ARCHIVE_CATEGORY_ID,
@@ -224,10 +231,13 @@ client.once('clientReady', async () => {
   }
   console.log(`Intent membri OK — ${members.size} membri in cache. Logger attivo.`);
 
-  if (KICK_SLUG && KICK_COUNTER_CHANNEL_ID) {
-    await updateKickCounter();
-    setInterval(updateKickCounter, KICK_REFRESH_MS);
-    console.log(`Contatore Kick attivo su ${KICK_SLUG}, aggiornamento ogni ${KICK_REFRESH_MS / 60000} minuti`);
+  if (KICK_SLUG && (KICK_COUNTER_CHANNEL_ID || LIVE_CHANNEL_ID || LIVE_ANNOUNCE_CHANNEL_ID)) {
+    await pollKick();
+    setInterval(pollKick, KICK_REFRESH_MS);
+    console.log(`Monitor Kick attivo su ${KICK_SLUG}, controllo ogni ${KICK_REFRESH_MS / 60000} minuti`);
+    if (LIVE_ANNOUNCE_CHANNEL_ID) {
+      console.log(`Annuncio live nel canale ${LIVE_ANNOUNCE_CHANNEL_ID} con ping ${liveMention() || 'disattivato'}`);
+    }
   }
 });
 
@@ -483,6 +493,65 @@ async function updateLiveMessage(data) {
   }
 }
 
+function liveMention() {
+  if (LIVE_PING_ROLE_ID) return `<@&${LIVE_PING_ROLE_ID}>`;
+  if (LIVE_ANNOUNCE_MENTION === 'none') return '';
+  if (LIVE_ANNOUNCE_MENTION === 'here') return '@here';
+  return '@everyone';
+}
+
+function liveAllowedMentions() {
+  if (LIVE_PING_ROLE_ID) return { roles: [LIVE_PING_ROLE_ID], parse: [] };
+  if (LIVE_ANNOUNCE_MENTION === 'none') return { parse: [] };
+  return { parse: ['everyone'] };
+}
+
+async function announceLive(raw) {
+  if (!LIVE_ANNOUNCE_CHANNEL_ID) return;
+
+  const stream = raw.livestream;
+  const state = await readLiveState();
+
+  if (!stream) {
+    if (state.live) await writeLiveState({ live: false });
+    return;
+  }
+
+  const sessionId = String(stream.id ?? stream.slug ?? stream.created_at ?? stream.start_time ?? '');
+  if (sessionId && sessionId === state.sessionId) {
+    if (!state.live) await writeLiveState({ live: true });
+    return;
+  }
+  if (Date.now() - (state.announcedAt ?? 0) < LIVE_ANNOUNCE_COOLDOWN_MS) {
+    await writeLiveState({ live: true, sessionId });
+    return;
+  }
+
+  const channel = await client.channels.fetch(LIVE_ANNOUNCE_CHANNEL_ID).catch(() => null);
+  if (!channel?.isTextBased()) {
+    console.error('Canale annuncio live non trovato:', LIVE_ANNOUNCE_CHANNEL_ID);
+    return;
+  }
+
+  const payload = buildLiveAnnouncement(raw, KICK_SLUG, {
+    mention: liveMention(),
+    pingRoleId: LIVE_PING_ROLE_ID,
+  });
+
+  const sent = await channel
+    .send({ ...payload, allowedMentions: liveAllowedMentions() })
+    .catch((err) => {
+      console.error('Annuncio live fallito:', err.message);
+      return null;
+    });
+
+  if (!sent) return;
+  if (sent.crosspostable) await sent.crosspost().catch(() => null);
+
+  await writeLiveState({ live: true, sessionId, announcedAt: Date.now(), messageId: sent.id });
+  console.log(`annuncio live inviato: ${sent.id}`);
+}
+
 const KICK_ENDPOINTS = [
   (slug) => `https://kick.com/api/v2/channels/${slug}`,
   (slug) => `https://kick.com/api/v1/channels/${slug}`,
@@ -532,8 +601,8 @@ async function fetchKickChannel() {
   throw new Error(errors.join(' | '));
 }
 
-async function updateKickCounter() {
-  if (!KICK_SLUG || !KICK_COUNTER_CHANNEL_ID) return;
+async function pollKick() {
+  if (!KICK_SLUG) return;
 
   let data;
   try {
@@ -545,12 +614,16 @@ async function updateKickCounter() {
 
   const { data: raw, followers } = data;
   await updateLiveMessage(raw);
+  await announceLive(raw);
 
   const live = Boolean(raw.livestream ?? raw.stream?.is_live);
   const name = `${live ? '🔴' : '🟢'}・𝗞𝗜𝗖𝗞: ${followers.toLocaleString('en-US')}`;
 
-  kickState = { followers, live, name, updatedAt: new Date().toISOString() };
-  if (name === kickState.applied) return;
+  const applied = kickState.applied;
+  kickState = { followers, live, name, updatedAt: new Date().toISOString(), applied };
+  if (!KICK_COUNTER_CHANNEL_ID) return;
+  if (name === applied) return;
+  if (Date.now() - lastRenameAt < RENAME_MIN_INTERVAL_MS) return;
 
   const channel = await client.channels.fetch(KICK_COUNTER_CHANNEL_ID).catch(() => null);
   if (!channel) {
@@ -565,6 +638,7 @@ async function updateKickCounter() {
   try {
     await channel.setName(name, 'Aggiornamento contatore follower Kick');
     kickState.applied = name;
+    lastRenameAt = Date.now();
     console.log(`contatore Kick aggiornato: ${name}`);
   } catch (err) {
     console.error('Rinomina contatore fallita:', err.message);
@@ -952,6 +1026,28 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ ...payload, ephemeral: true });
       return;
     }
+    if (interaction.isButton() && interaction.customId === 'live_notify_toggle') {
+      if (!LIVE_PING_ROLE_ID) {
+        await interaction.reply({ content: 'Live notifications are not configured.', ephemeral: true });
+        return;
+      }
+      const hasRole = interaction.member.roles.cache.has(LIVE_PING_ROLE_ID);
+      try {
+        if (hasRole) await interaction.member.roles.remove(LIVE_PING_ROLE_ID, 'Live notifications off');
+        else await interaction.member.roles.add(LIVE_PING_ROLE_ID, 'Live notifications on');
+      } catch (err) {
+        await interaction.reply({ content: `Could not update your role: ${err.message}`, ephemeral: true });
+        return;
+      }
+      await interaction.reply({
+        content: hasRole
+          ? '🔕 You will no longer be pinged when the stream starts.'
+          : '🔔 You will be pinged every time the stream starts.',
+        ephemeral: true,
+      });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('membri:')) {
       await interaction.deferUpdate();
       const page = Number(interaction.customId.split(':')[1]) || 0;
