@@ -46,6 +46,7 @@ const LIVE_ANNOUNCE_REPEATS = Math.max(1, Number(process.env.LIVE_ANNOUNCE_REPEA
 const LIVE_ANNOUNCE_REPEAT_EVERY_MS = (Number(process.env.LIVE_ANNOUNCE_REPEAT_EVERY_MIN) || 8) * 60 * 1000;
 const LIVE_ANNOUNCE_WINDOW_MS = (Number(process.env.LIVE_ANNOUNCE_WINDOW_MIN) || 20) * 60 * 1000;
 const LIVE_ANNOUNCE_TTL_MS = (Number(process.env.LIVE_ANNOUNCE_DELETE_AFTER_MIN ?? 20)) * 60 * 1000;
+const liveAnnouncementIds = new Set();
 const RENAME_MIN_INTERVAL_MS = 10 * 60 * 1000;
 let liveMessageId = null;
 let lastRenameAt = 0;
@@ -236,6 +237,7 @@ client.once('clientReady', async () => {
   console.log(`Intent membri OK — ${members.size} membri in cache. Logger attivo.`);
 
   if (KICK_SLUG && (KICK_COUNTER_CHANNEL_ID || LIVE_CHANNEL_ID || LIVE_ANNOUNCE_CHANNEL_ID)) {
+    trackAnnouncements((await readLiveState()).messages);
     await pollKick();
     setInterval(pollKick, KICK_REFRESH_MS);
     console.log(`Monitor Kick attivo su ${KICK_SLUG}, controllo ogni ${KICK_REFRESH_MS / 60000} minuti`);
@@ -510,7 +512,13 @@ function liveAllowedMentions() {
   return { parse: ['everyone'] };
 }
 
+function trackAnnouncements(refs) {
+  liveAnnouncementIds.clear();
+  for (const ref of refs ?? []) liveAnnouncementIds.add(ref.id);
+}
+
 async function deleteAnnouncement(ref) {
+  liveAnnouncementIds.delete(ref.id);
   const channel = await client.channels.fetch(ref.channelId).catch(() => null);
   const message = await channel?.messages?.fetch(ref.id).catch(() => null);
   if (message) await message.delete().catch(() => null);
@@ -531,6 +539,7 @@ async function pruneAnnouncements(all = false) {
     await writeLiveState({ messages: keep });
     console.log(`annunci live rimossi: ${refs.length - keep.length}`);
   }
+  trackAnnouncements(keep);
   return keep;
 }
 
@@ -560,6 +569,7 @@ async function sendAnnouncement(raw, sessionId, reminder) {
 
   const state = await readLiveState();
   const ref = { channelId: sent.channelId, id: sent.id, sentAt: Date.now() };
+  liveAnnouncementIds.add(sent.id);
   await writeLiveState({
     live: true,
     sessionId,
@@ -1170,7 +1180,8 @@ createServer(async (req, res) => {
 
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot) return;
-  if (!NO_REACTION_CHANNELS.includes(reaction.message.channelId)) return;
+  const onAnnouncement = liveAnnouncementIds.has(reaction.message.id);
+  if (!onAnnouncement && !NO_REACTION_CHANNELS.includes(reaction.message.channelId)) return;
 
   try {
     if (reaction.partial) await reaction.fetch();
