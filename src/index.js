@@ -72,7 +72,10 @@ const CODES_MENTION = (process.env.CODES_MENTION || 'role').toLowerCase();
 const CODES_MIN_VALUE = Number(process.env.CODES_MIN_VALUE) || 0;
 const CODES_REDEEM_URL = process.env.CODES_REDEEM_URL || 'https://shuffle.com';
 const CODES_TOPIC = 'Automatic Shuffle code drops from fairgambling.com/livecodes';
+const CODES_WEBHOOK_NAME = process.env.CODES_WEBHOOK_NAME || 'Code Drops';
+const CODES_WEBHOOK_ENABLED = process.env.CODES_WEBHOOK !== 'false';
 let codesChannelId = null;
+let codesWebhook = null;
 const codeMessageIds = new Set();
 
 const TICKET_CONFIG = {
@@ -815,6 +818,34 @@ function casinoEmoji(slug) {
   return client.emojis.cache.find((e) => e.name === slug)?.toString() ?? '';
 }
 
+function casinoAvatar(slug) {
+  return client.emojis.cache.find((e) => e.name === slug)?.imageURL({ size: 128, extension: 'png' }) ?? null;
+}
+
+async function getCodesWebhook(channel) {
+  if (!CODES_WEBHOOK_ENABLED) return null;
+  if (codesWebhook) return codesWebhook;
+
+  const hooks = await channel.fetchWebhooks().catch((err) => {
+    console.error('Lettura webhook fallita:', err.message);
+    return null;
+  });
+  codesWebhook = hooks?.find((h) => h.owner?.id === client.user.id && h.token) ?? null;
+  if (codesWebhook) return codesWebhook;
+
+  codesWebhook = await channel
+    .createWebhook({
+      name: CODES_WEBHOOK_NAME,
+      avatar: casinoAvatar(CODES_BRANDS[0]) ?? undefined,
+      reason: 'Identita dedicata ai code drop',
+    })
+    .catch((err) => {
+      console.error('Creazione webhook fallita:', err.message);
+      return null;
+    });
+  return codesWebhook;
+}
+
 async function postCode(entry) {
   const channel = await client.channels.fetch(codesChannelId).catch(() => null);
   if (!channel?.isTextBased()) return;
@@ -826,16 +857,35 @@ async function postCode(entry) {
     emoji: casinoEmoji(entry.slug),
   });
 
-  const sent = await channel
-    .send({ ...payload, allowedMentions: codesAllowedMentions() })
-    .catch((err) => {
+  const webhook = await getCodesWebhook(channel);
+  const options = { ...payload, allowedMentions: codesAllowedMentions() };
+
+  const sent = webhook
+    ? await webhook
+      .send({
+        ...options,
+        username: `${entry.casino} Drops`.slice(0, 80),
+        avatarURL: casinoAvatar(entry.slug) ?? undefined,
+        withComponents: true,
+      })
+      .catch((err) => {
+        console.error('Invio webhook fallito:', err.message);
+        return null;
+      })
+    : await channel.send(options).catch((err) => {
       console.error('Invio code drop fallito:', err.message);
       return null;
     });
   if (!sent) return;
 
   codeMessageIds.add(sent.id);
-  await addPosted({ channelId: sent.channelId, id: sent.id, endAt: entry.endAt, entry });
+  await addPosted({
+    channelId: sent.channel_id ?? sent.channelId ?? channel.id,
+    id: sent.id,
+    endAt: entry.endAt,
+    entry,
+    viaWebhook: Boolean(webhook),
+  });
   console.log(`code drop pubblicato: ${entry.casino} ${entry.code} ($${entry.value})`);
 
   if (entry.endAt && entry.endAt > Date.now()) {
@@ -848,15 +898,23 @@ async function postCode(entry) {
 async function sweepExpiredCodes() {
   const expired = await takeExpiredPosts();
   for (const post of expired) {
+    const payload = {
+      ...expiredCodeMessage(post.entry, { redeemUrl: CODES_REDEEM_URL, emoji: casinoEmoji(post.entry?.slug) }),
+      allowedMentions: { parse: [] },
+    };
+
+    if (post.viaWebhook) {
+      const channel = await client.channels.fetch(post.channelId).catch(() => null);
+      const webhook = channel ? await getCodesWebhook(channel) : null;
+      if (webhook) {
+        await webhook.editMessage(post.id, payload).catch(() => null);
+        continue;
+      }
+    }
+
     const channel = await client.channels.fetch(post.channelId).catch(() => null);
     const message = await channel?.messages?.fetch(post.id).catch(() => null);
-    if (!message) continue;
-    await message
-      .edit({
-        ...expiredCodeMessage(post.entry, { redeemUrl: CODES_REDEEM_URL, emoji: casinoEmoji(post.entry?.slug) }),
-        allowedMentions: { parse: [] },
-      })
-      .catch(() => null);
+    if (message) await message.edit(payload).catch(() => null);
   }
 }
 
