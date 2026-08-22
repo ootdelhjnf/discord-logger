@@ -426,7 +426,20 @@ let kickState = { followers: null, live: false, name: null, updatedAt: null };
 const KICK_ENDPOINTS = [
   (slug) => `https://kick.com/api/v2/channels/${slug}`,
   (slug) => `https://kick.com/api/v1/channels/${slug}`,
+  (slug) => `https://api.kick.com/public/v1/channels?slug=${slug}`,
 ];
+
+function extractFollowers(data) {
+  const node = Array.isArray(data?.data) ? data.data[0] : data;
+  const candidates = [
+    node?.followers_count,
+    node?.followersCount,
+    node?.followers,
+    node?.user?.followers_count,
+    node?.chatroom?.followers_count,
+  ];
+  return candidates.find((v) => typeof v === 'number') ?? null;
+}
 
 async function fetchKickChannel() {
   const errors = [];
@@ -448,8 +461,10 @@ async function fetchKickChannel() {
         continue;
       }
       const data = JSON.parse(body);
-      if (typeof data?.followers_count === 'number') return data;
-      errors.push(`campo mancante su ${url}: ${body.slice(0, 90)}`);
+      const followers = extractFollowers(data);
+      if (followers !== null) return { data, followers };
+      const node = Array.isArray(data?.data) ? data.data[0] : data;
+      errors.push(`campi disponibili su ${url}: ${Object.keys(node ?? {}).join(',')}`);
     } catch (err) {
       errors.push(`${url}: ${err.message.slice(0, 90)}`);
     }
@@ -468,9 +483,9 @@ async function updateKickCounter() {
     return;
   }
 
-  const followers = data.followers_count;
+  const { data: raw, followers } = data;
 
-  const live = Boolean(data.livestream);
+  const live = Boolean(raw.livestream ?? raw.stream?.is_live);
   const name = `${live ? '🔴' : '🟢'}・𝗞𝗜𝗖𝗞: ${followers.toLocaleString('en-US')}`;
 
   kickState = { followers, live, name, updatedAt: new Date().toISOString() };
