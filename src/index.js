@@ -1,0 +1,484 @@
+import { createServer } from 'node:http';
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  AuditLogEvent,
+  time,
+} from 'discord.js';
+
+const TOKEN = process.env.DISCORD_TOKEN;
+const GUILD_ID = process.env.GUILD_ID;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
+const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
+
+if (!TOKEN || !GUILD_ID || !LOG_CHANNEL_ID) {
+  console.error('Mancano DISCORD_TOKEN, GUILD_ID o LOG_CHANNEL_ID nel file .env');
+  process.exit(1);
+}
+
+const VIEW = { size: 512, extension: 'png', forceStatic: false };
+const FULL = { size: 4096, extension: 'png', forceStatic: false };
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildModeration,
+  ],
+  partials: [Partials.GuildMember, Partials.User],
+});
+
+async function getLogChannel() {
+  const channel = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+  if (!channel || !channel.isTextBased()) {
+    console.error('Canale di log non trovato o non testuale:', LOG_CHANNEL_ID);
+    return null;
+  }
+  return channel;
+}
+
+async function send(embed, buttons = []) {
+  const channel = await getLogChannel();
+  if (!channel) return;
+  const components = buttons.length
+    ? [new ActionRowBuilder().addComponents(...buttons.slice(0, 5))]
+    : [];
+  await channel
+    .send({ embeds: [embed], components })
+    .catch((err) => console.error('Invio fallito:', err.message));
+}
+
+function linkButton(label, url, emoji) {
+  const b = new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(label).setURL(url);
+  if (emoji) b.setEmoji(emoji);
+  return b;
+}
+
+async function freshUser(userOrId) {
+  const id = typeof userOrId === 'string' ? userOrId : userOrId.id;
+  const fetched = await client.users.fetch(id, { force: true }).catch(() => null);
+  return fetched ?? (typeof userOrId === 'string' ? null : userOrId);
+}
+
+function avatarSources(user, member) {
+  const global = user.displayAvatarURL(VIEW);
+  const server = member?.avatar ? member.displayAvatarURL(VIEW) : null;
+  return { global, server, shown: server ?? global };
+}
+
+function baseEmbed(user, member) {
+  const { shown } = avatarSources(user, member);
+  return new EmbedBuilder()
+    .setAuthor({ name: user.tag, iconURL: shown })
+    .setThumbnail(shown)
+    .setImage(shown)
+    .setFooter({ text: `ID: ${user.id}`, iconURL: shown })
+    .setTimestamp(new Date());
+}
+
+function identityField(user, member) {
+  const rows = [`Username: \`@${user.username}\``];
+  if (user.globalName) rows.push(`Nome visualizzato: **${user.globalName}**`);
+  if (member?.nickname) rows.push(`Nickname nel server: **${member.nickname}**`);
+  return rows.join('\n');
+}
+
+function socialField(user) {
+  const items = [];
+  if (user.bannerURL?.(VIEW)) items.push(`[Banner del profilo](${user.bannerURL(FULL)})`);
+  if (user.accentColor) items.push(`Colore profilo \`#${user.accentColor.toString(16).padStart(6, '0')}\``);
+  if (user.flags?.toArray?.().length) items.push(`Badge: ${user.flags.toArray().join(', ')}`);
+  items.push(`[Apri profilo](https://discord.com/users/${user.id})`);
+  return items.join('\n');
+}
+
+async function assignAutoRole(member) {
+  if (!AUTO_ROLE_ID) return null;
+  if (member.roles.cache.has(AUTO_ROLE_ID)) return { ok: true, text: 'gia presente' };
+
+  const role = member.guild.roles.cache.get(AUTO_ROLE_ID)
+    ?? (await member.guild.roles.fetch(AUTO_ROLE_ID).catch(() => null));
+  if (!role) return { ok: false, text: `ruolo ${AUTO_ROLE_ID} inesistente` };
+
+  const me = await member.guild.members.fetchMe();
+  if (!me.permissions.has('ManageRoles')) {
+    return { ok: false, text: "manca il permesso 'Gestisci ruoli' al bot" };
+  }
+  if (role.position >= me.roles.highest.position) {
+    return { ok: false, text: `${role.name} e piu in alto del ruolo del bot` };
+  }
+  if (role.managed) return { ok: false, text: `${role.name} e gestito da un'integrazione` };
+
+  try {
+    await member.roles.add(role, 'Autorole ingresso');
+    return { ok: true, text: `${role} assegnato` };
+  } catch (err) {
+    return { ok: false, text: err.message };
+  }
+}
+
+async function findRemovalReason(guild, userId) {
+  const me = await guild.members.fetchMe().catch(() => null);
+  if (!me?.permissions.has('ViewAuditLog')) return null;
+
+  const types = [AuditLogEvent.MemberKick, AuditLogEvent.MemberBanAdd];
+  for (const type of types) {
+    const logs = await guild.fetchAuditLogs({ type, limit: 5 }).catch(() => null);
+    const entry = logs?.entries.find(
+      (e) => e.target?.id === userId && Date.now() - e.createdTimestamp < 10_000,
+    );
+    if (entry) {
+      return {
+        action: type === AuditLogEvent.MemberKick ? 'Espulso (kick)' : 'Bannato',
+        executor: entry.executor ? `${entry.executor.tag}` : 'sconosciuto',
+        reason: entry.reason || 'nessuna motivazione',
+      };
+    }
+  }
+  return null;
+}
+
+client.once('clientReady', async () => {
+  console.log(`Bot online come ${client.user.tag}`);
+
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  if (!guild) {
+    console.error(`Il bot NON e' nel server ${GUILD_ID}. Invitalo con l'URL OAuth2.`);
+    return;
+  }
+  console.log(`Server: ${guild.name}`);
+
+  const channel = await getLogChannel();
+  if (!channel) return;
+  console.log(`Canale di log: #${channel.name}`);
+
+  const me = await guild.members.fetchMe();
+  const perms = channel.permissionsFor(me);
+  const missing = ['ViewChannel', 'SendMessages', 'EmbedLinks'].filter((p) => !perms.has(p));
+  if (missing.length) {
+    console.error(`Permessi mancanti sul canale: ${missing.join(', ')}`);
+    return;
+  }
+  if (!me.permissions.has('ViewAuditLog')) {
+    console.warn("Permesso 'Visualizza registro attivita' mancante: niente motivo kick/ban.");
+  }
+
+  if (AUTO_ROLE_ID) {
+    const role = await guild.roles.fetch(AUTO_ROLE_ID).catch(() => null);
+    if (!role) console.error(`Autorole: ruolo ${AUTO_ROLE_ID} non trovato.`);
+    else if (!me.permissions.has('ManageRoles')) console.error(`Autorole '${role.name}': manca il permesso 'Gestisci ruoli'.`);
+    else if (role.position >= me.roles.highest.position) console.error(`Autorole '${role.name}': e sopra al ruolo del bot.`);
+    else console.log(`Autorole attivo: ${role.name}`);
+  }
+
+  const members = await guild.members.fetch().catch(() => null);
+  if (!members) {
+    console.error('SERVER MEMBERS INTENT non attivo nel Developer Portal: gli eventi non arriveranno.');
+    return;
+  }
+  console.log(`Intent membri OK — ${members.size} membri in cache. Logger attivo.`);
+});
+
+client.on('guildMemberAdd', async (member) => {
+  if (member.guild.id !== GUILD_ID) return;
+
+  const user = await freshUser(member.user);
+  const created = user.createdAt;
+  const ageDays = Math.floor((Date.now() - created.getTime()) / 86_400_000);
+  const { global, server } = avatarSources(user, member);
+
+  const embed = baseEmbed(user, member)
+    .setColor(0x2ecc71)
+    .setTitle('Entrato nel server')
+    .setDescription(`${member} — **${user.tag}**`)
+    .addFields(
+      { name: 'Identita', value: identityField(user, member) },
+      { name: 'Account creato', value: `${time(created, 'f')} (${ageDays} giorni fa)`, inline: true },
+      { name: 'Membri totali', value: `${member.guild.memberCount}`, inline: true },
+      { name: 'Collegamenti', value: socialField(user) },
+    );
+
+  if (ageDays < 7) {
+    embed.addFields({ name: 'Attenzione', value: 'Account molto recente', inline: true });
+  }
+
+  if (!member.pending) {
+    const auto = await assignAutoRole(member);
+    if (auto) {
+      embed.addFields({ name: auto.ok ? 'Ruolo automatico' : 'Ruolo automatico fallito', value: auto.text });
+    }
+  } else {
+    embed.addFields({
+      name: 'Ruolo automatico',
+      value: 'in attesa: deve accettare le regole del server',
+    });
+  }
+
+  const buttons = [linkButton('Scarica immagine', user.displayAvatarURL(FULL), '⬇️')];
+  if (server) buttons.push(linkButton('Scarica avatar server', member.displayAvatarURL(FULL), '⬇️'));
+  buttons.push(linkButton('Profilo', `https://discord.com/users/${user.id}`, '👤'));
+
+  await send(embed, buttons);
+});
+
+client.on('guildMemberRemove', async (member) => {
+  if (member.guild.id !== GUILD_ID) return;
+
+  const user = await freshUser(member.user ?? member.id);
+  if (!user) return;
+
+  const roles = member.roles?.cache
+    ?.filter((r) => r.id !== member.guild.id)
+    .sort((a, b) => b.position - a.position)
+    .map((r) => r.name)
+    .slice(0, 15);
+
+  const embed = baseEmbed(user, member)
+    .setColor(0xe74c3c)
+    .setTitle('Uscito dal server')
+    .setDescription(`**${user.tag}**`)
+    .addFields(
+      { name: 'Identita', value: identityField(user, member) },
+      { name: 'Membri totali', value: `${member.guild.memberCount}`, inline: true },
+    );
+
+  if (member.joinedAt) {
+    embed.addFields({ name: 'Era entrato il', value: time(member.joinedAt, 'f'), inline: true });
+  }
+  if (roles?.length) {
+    embed.addFields({ name: 'Ruoli che aveva', value: roles.join(', ').slice(0, 1024) });
+  }
+  embed.addFields({ name: 'Collegamenti', value: socialField(user) });
+
+  const removal = await findRemovalReason(member.guild, member.id);
+  if (removal) {
+    embed.addFields({
+      name: removal.action,
+      value: `da **${removal.executor}**\nMotivo: ${removal.reason}`,
+    });
+  }
+
+  const buttons = [linkButton('Scarica immagine', user.displayAvatarURL(FULL), '⬇️')];
+  if (member.avatar) buttons.push(linkButton('Scarica avatar server', member.displayAvatarURL(FULL), '⬇️'));
+  buttons.push(linkButton('Profilo', `https://discord.com/users/${user.id}`, '👤'));
+
+  await send(embed, buttons);
+});
+
+client.on('userUpdate', async (oldUser, newUser) => {
+  const guild = client.guilds.cache.get(GUILD_ID);
+  const member = guild?.members.cache.get(newUser.id);
+  if (!member) return;
+
+  const changedName = oldUser.username !== newUser.username;
+  const changedGlobal = oldUser.globalName !== newUser.globalName;
+  const changedAvatar = oldUser.avatar !== newUser.avatar;
+  const changedBanner = oldUser.banner !== newUser.banner;
+  if (!changedName && !changedGlobal && !changedAvatar && !changedBanner) return;
+
+  const oldAvatar = oldUser.displayAvatarURL(VIEW);
+  const newAvatar = newUser.displayAvatarURL(VIEW);
+
+  const embed = new EmbedBuilder()
+    .setColor(0x3498db)
+    .setTitle('Profilo aggiornato')
+    .setDescription(`${member} — **${newUser.tag}**`)
+    .setAuthor({ name: newUser.tag, iconURL: newAvatar })
+    .setThumbnail(oldAvatar)
+    .setImage(newAvatar)
+    .setFooter({ text: `ID: ${newUser.id} · sinistra = prima, grande = adesso`, iconURL: newAvatar })
+    .setTimestamp(new Date());
+
+  const buttons = [];
+
+  if (changedName) {
+    embed.addFields({
+      name: 'Username cambiato',
+      value: `Vecchio: \`@${oldUser.username}\`\nNuovo: \`@${newUser.username}\``,
+    });
+  }
+  if (changedGlobal) {
+    embed.addFields({
+      name: 'Nome visualizzato cambiato',
+      value: `Vecchio: **${oldUser.globalName ?? 'nessuno'}**\nNuovo: **${newUser.globalName ?? 'nessuno'}**`,
+    });
+  }
+  if (changedAvatar) {
+    embed.addFields({
+      name: 'Immagine profilo cambiata',
+      value: `[Vecchia immagine](${oldUser.displayAvatarURL(FULL)})\n[Nuova immagine](${newUser.displayAvatarURL(FULL)})`,
+    });
+    buttons.push(
+      linkButton('Scarica vecchia', oldUser.displayAvatarURL(FULL), '⬅️'),
+      linkButton('Scarica nuova', newUser.displayAvatarURL(FULL), '⬇️'),
+    );
+  }
+  if (changedBanner) {
+    const before = oldUser.bannerURL?.(FULL);
+    const after = newUser.bannerURL?.(FULL);
+    embed.addFields({
+      name: 'Banner cambiato',
+      value: [
+        before ? `[Vecchio banner](${before})` : 'Vecchio: nessuno',
+        after ? `[Nuovo banner](${after})` : 'Nuovo: rimosso',
+      ].join('\n'),
+    });
+    if (after) buttons.push(linkButton('Scarica banner', after, '🖼️'));
+  }
+
+  embed.addFields({ name: 'Collegamenti', value: socialField(newUser) });
+  buttons.push(linkButton('Profilo', `https://discord.com/users/${newUser.id}`, '👤'));
+
+  await send(embed, buttons);
+});
+
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+  if (newMember.guild.id !== GUILD_ID) return;
+
+  if (oldMember.pending && !newMember.pending) {
+    const auto = await assignAutoRole(newMember);
+    if (auto) {
+      const embed = new EmbedBuilder()
+        .setColor(auto.ok ? 0x2ecc71 : 0xe67e22)
+        .setTitle(auto.ok ? 'Regole accettate — ruolo assegnato' : 'Regole accettate — ruolo NON assegnato')
+        .setDescription(`${newMember} — **${newMember.user.tag}**`)
+        .setThumbnail(newMember.displayAvatarURL(VIEW))
+        .addFields({ name: 'Esito', value: auto.text })
+        .setFooter({ text: `ID: ${newMember.id}` })
+        .setTimestamp(new Date());
+      await send(embed);
+    }
+  }
+
+  const changedAvatar = oldMember.avatar !== newMember.avatar;
+  const changedNick = oldMember.nickname !== newMember.nickname;
+  if (!changedAvatar && !changedNick) return;
+
+  const shown = newMember.displayAvatarURL(VIEW);
+  const embed = new EmbedBuilder()
+    .setColor(0x9b59b6)
+    .setTitle('Profilo del server aggiornato')
+    .setDescription(`${newMember} — **${newMember.user.tag}**`)
+    .setAuthor({ name: newMember.user.tag, iconURL: shown })
+    .setThumbnail(oldMember.displayAvatarURL(VIEW))
+    .setImage(shown)
+    .setFooter({ text: `ID: ${newMember.id} · sinistra = prima, grande = adesso`, iconURL: shown })
+    .setTimestamp(new Date());
+
+  const buttons = [];
+
+  if (changedNick) {
+    embed.addFields({
+      name: 'Nickname nel server cambiato',
+      value: `Vecchio: **${oldMember.nickname ?? 'nessuno'}**\nNuovo: **${newMember.nickname ?? 'nessuno'}**`,
+    });
+  }
+  if (changedAvatar) {
+    embed.addFields({
+      name: 'Avatar del server cambiato',
+      value: `[Vecchia immagine](${oldMember.displayAvatarURL(FULL)})\n[Nuova immagine](${newMember.displayAvatarURL(FULL)})`,
+    });
+    buttons.push(
+      linkButton('Scarica vecchia', oldMember.displayAvatarURL(FULL), '⬅️'),
+      linkButton('Scarica nuova', newMember.displayAvatarURL(FULL), '⬇️'),
+    );
+  }
+
+  embed.addFields({ name: 'Collegamenti', value: socialField(newMember.user) });
+  buttons.push(linkButton('Profilo', `https://discord.com/users/${newMember.id}`, '👤'));
+
+  await send(embed, buttons);
+});
+
+const PAGE_SIZE = 20;
+
+async function membersPage(guild, page) {
+  const all = await guild.members.fetch();
+  const sorted = [...all.values()].sort(
+    (a, b) => (a.joinedTimestamp ?? 0) - (b.joinedTimestamp ?? 0),
+  );
+  const humans = sorted.filter((m) => !m.user.bot);
+  const bots = sorted.filter((m) => m.user.bot);
+  const pages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
+  const current = Math.min(Math.max(page, 0), pages - 1);
+  const slice = sorted.slice(current * PAGE_SIZE, current * PAGE_SIZE + PAGE_SIZE);
+
+  const lines = slice.map((m, i) => {
+    const n = current * PAGE_SIZE + i + 1;
+    const name = m.nickname ?? m.user.globalName ?? m.user.username;
+    const joined = m.joinedAt ? time(m.joinedAt, 'd') : 'data ignota';
+    return `\`${String(n).padStart(4)}\` ${m.user.bot ? '🤖' : '👤'} **${name}** \`@${m.user.username}\` · ${joined}`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('Tutti i membri del server')
+    .setDescription(lines.join('\n') || 'nessun membro')
+    .addFields(
+      { name: 'Totale', value: `${sorted.length}`, inline: true },
+      { name: 'Persone', value: `${humans.length}`, inline: true },
+      { name: 'Bot', value: `${bots.length}`, inline: true },
+    )
+    .setFooter({ text: `Pagina ${current + 1} di ${pages} · online e offline inclusi` })
+    .setTimestamp(new Date());
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`membri:${current - 1}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setLabel('Indietro')
+      .setEmoji('⬅️')
+      .setDisabled(current === 0),
+    new ButtonBuilder()
+      .setCustomId(`membri:${current + 1}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setLabel('Avanti')
+      .setEmoji('➡️')
+      .setDisabled(current >= pages - 1),
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+client.on('interactionCreate', async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand() && interaction.commandName === 'membri') {
+      await interaction.deferReply({ ephemeral: true });
+      const payload = await membersPage(interaction.guild, 0);
+      await interaction.editReply(payload);
+      return;
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('membri:')) {
+      await interaction.deferUpdate();
+      const page = Number(interaction.customId.split(':')[1]) || 0;
+      const payload = await membersPage(interaction.guild, page);
+      await interaction.editReply(payload);
+    }
+  } catch (err) {
+    console.error('Interazione fallita:', err.message);
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+createServer((req, res) => {
+  const ready = client.isReady();
+  res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
+  res.end(
+    JSON.stringify({
+      status: ready ? 'online' : 'connecting',
+      bot: client.user?.tag ?? null,
+      guilds: client.guilds.cache.size,
+      uptimeSeconds: Math.floor(process.uptime()),
+    }),
+  );
+}).listen(PORT, () => console.log(`Keep-alive HTTP in ascolto sulla porta ${PORT}`));
+
+client.on('error', (err) => console.error('Errore client:', err.message));
+process.on('unhandledRejection', (err) => console.error('Promise non gestita:', err));
+
+client.login(TOKEN);

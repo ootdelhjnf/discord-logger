@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: discord-logger
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: LOG_CHANNEL_ID
+        sync: false
+      - key: AUTO_ROLE_ID
+        sync: false
