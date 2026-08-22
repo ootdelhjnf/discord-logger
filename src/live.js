@@ -26,7 +26,7 @@ function streamStartedAt(live) {
   return Number.isNaN(ms) ? Date.now() : ms;
 }
 
-export function buildLiveAnnouncement(data, slug, { mention = '', pingRoleId = null } = {}) {
+export function buildLiveAnnouncement(data, slug, { mention = '', pingRoleId = null, reminder = 0, expiresAt = null } = {}) {
   const url = `https://kick.com/${slug}`;
   const live = data.livestream;
   const displayName = data.user?.username ?? slug;
@@ -36,13 +36,15 @@ export function buildLiveAnnouncement(data, slug, { mention = '', pingRoleId = n
   const embed = new EmbedBuilder()
     .setColor(0xff3131)
     .setAuthor({ name: displayName, url, iconURL: avatar ?? undefined })
-    .setTitle(`🔴 ${displayName} is LIVE on Kick!`.slice(0, 250))
+    .setTitle(`🔴 ${displayName} is ${reminder ? 'STILL LIVE' : 'LIVE'} on Kick!`.slice(0, 250))
     .setURL(url)
     .setDescription(
       [
         live?.session_title ? `**${live.session_title}**` : '**The stream just started.**',
         '',
-        'Jump in now, chat with us and do not miss the drops and the giveaways.',
+        reminder
+          ? 'The stream is still running, hop in before you miss it.'
+          : 'Jump in now, chat with us and do not miss the drops and the giveaways.',
       ].join('\n'),
     )
     .addFields({ name: 'Started', value: `<t:${Math.floor(startedAt / 1000)}:R>`, inline: true });
@@ -53,8 +55,18 @@ export function buildLiveAnnouncement(data, slug, { mention = '', pingRoleId = n
     embed.addFields({ name: 'Followers', value: data.followers_count.toLocaleString('en-US'), inline: true });
   }
 
+  if (typeof live?.viewer_count === 'number') {
+    embed.addFields({ name: 'Viewers', value: live.viewer_count.toLocaleString('en-US'), inline: true });
+  }
+
   const thumb = pickThumbnail(data);
   if (thumb) embed.setImage(thumb);
+  if (expiresAt) {
+    embed.addFields({
+      name: 'Heads up',
+      value: `This notification disappears <t:${Math.floor(expiresAt / 1000)}:R> to keep the channel clean.`,
+    });
+  }
   embed.setFooter({ text: 'Kick live notification' }).setTimestamp(new Date());
 
   const row = new ActionRowBuilder().addComponents(

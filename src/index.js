@@ -42,6 +42,10 @@ const LIVE_ANNOUNCE_CHANNEL_ID = process.env.LIVE_ANNOUNCE_CHANNEL_ID || LIVE_CH
 const LIVE_PING_ROLE_ID = process.env.LIVE_PING_ROLE_ID;
 const LIVE_ANNOUNCE_MENTION = (process.env.LIVE_ANNOUNCE_MENTION || 'everyone').toLowerCase();
 const LIVE_ANNOUNCE_COOLDOWN_MS = (Number(process.env.LIVE_ANNOUNCE_COOLDOWN_MIN) || 60) * 60 * 1000;
+const LIVE_ANNOUNCE_REPEATS = Math.max(1, Number(process.env.LIVE_ANNOUNCE_REPEATS ?? 3));
+const LIVE_ANNOUNCE_REPEAT_EVERY_MS = (Number(process.env.LIVE_ANNOUNCE_REPEAT_EVERY_MIN) || 8) * 60 * 1000;
+const LIVE_ANNOUNCE_WINDOW_MS = (Number(process.env.LIVE_ANNOUNCE_WINDOW_MIN) || 20) * 60 * 1000;
+const LIVE_ANNOUNCE_TTL_MS = (Number(process.env.LIVE_ANNOUNCE_DELETE_AFTER_MIN ?? 20)) * 60 * 1000;
 const RENAME_MIN_INTERVAL_MS = 10 * 60 * 1000;
 let liveMessageId = null;
 let lastRenameAt = 0;
@@ -506,36 +510,43 @@ function liveAllowedMentions() {
   return { parse: ['everyone'] };
 }
 
-async function announceLive(raw) {
-  if (!LIVE_ANNOUNCE_CHANNEL_ID) return;
+async function deleteAnnouncement(ref) {
+  const channel = await client.channels.fetch(ref.channelId).catch(() => null);
+  const message = await channel?.messages?.fetch(ref.id).catch(() => null);
+  if (message) await message.delete().catch(() => null);
+}
 
-  const stream = raw.livestream;
+async function pruneAnnouncements(all = false) {
   const state = await readLiveState();
+  const refs = state.messages ?? [];
+  if (!refs.length) return refs;
 
-  if (!stream) {
-    if (state.live) await writeLiveState({ live: false });
-    return;
+  const keep = [];
+  for (const ref of refs) {
+    const expired = all || (LIVE_ANNOUNCE_TTL_MS > 0 && Date.now() - ref.sentAt >= LIVE_ANNOUNCE_TTL_MS);
+    if (expired) await deleteAnnouncement(ref);
+    else keep.push(ref);
   }
+  if (keep.length !== refs.length) {
+    await writeLiveState({ messages: keep });
+    console.log(`annunci live rimossi: ${refs.length - keep.length}`);
+  }
+  return keep;
+}
 
-  const sessionId = String(stream.id ?? stream.slug ?? stream.created_at ?? stream.start_time ?? '');
-  if (sessionId && sessionId === state.sessionId) {
-    if (!state.live) await writeLiveState({ live: true });
-    return;
-  }
-  if (Date.now() - (state.announcedAt ?? 0) < LIVE_ANNOUNCE_COOLDOWN_MS) {
-    await writeLiveState({ live: true, sessionId });
-    return;
-  }
-
+async function sendAnnouncement(raw, sessionId, reminder) {
   const channel = await client.channels.fetch(LIVE_ANNOUNCE_CHANNEL_ID).catch(() => null);
   if (!channel?.isTextBased()) {
     console.error('Canale annuncio live non trovato:', LIVE_ANNOUNCE_CHANNEL_ID);
     return;
   }
 
+  const expiresAt = LIVE_ANNOUNCE_TTL_MS > 0 ? Date.now() + LIVE_ANNOUNCE_TTL_MS : null;
   const payload = buildLiveAnnouncement(raw, KICK_SLUG, {
     mention: liveMention(),
     pingRoleId: LIVE_PING_ROLE_ID,
+    reminder,
+    expiresAt,
   });
 
   const sent = await channel
@@ -544,12 +555,64 @@ async function announceLive(raw) {
       console.error('Annuncio live fallito:', err.message);
       return null;
     });
-
   if (!sent) return;
   if (sent.crosspostable) await sent.crosspost().catch(() => null);
 
-  await writeLiveState({ live: true, sessionId, announcedAt: Date.now(), messageId: sent.id });
-  console.log(`annuncio live inviato: ${sent.id}`);
+  const state = await readLiveState();
+  const ref = { channelId: sent.channelId, id: sent.id, sentAt: Date.now() };
+  await writeLiveState({
+    live: true,
+    sessionId,
+    messages: [...(state.messages ?? []), ref],
+    announcedAt: reminder === 0 ? Date.now() : state.announcedAt,
+    lastAnnouncedAt: Date.now(),
+    count: reminder + 1,
+  });
+
+  if (expiresAt) {
+    setTimeout(() => {
+      pruneAnnouncements().catch(() => null);
+    }, LIVE_ANNOUNCE_TTL_MS + 1000).unref?.();
+  }
+  console.log(`annuncio live inviato (${reminder + 1}/${LIVE_ANNOUNCE_REPEATS}): ${sent.id}`);
+}
+
+async function announceLive(raw) {
+  if (!LIVE_ANNOUNCE_CHANNEL_ID) return;
+
+  const stream = raw.livestream;
+  const state = await readLiveState();
+
+  if (!stream) {
+    await pruneAnnouncements(true);
+    if (state.live) await writeLiveState({ live: false, count: 0 });
+    return;
+  }
+
+  const sessionId = String(stream.id ?? stream.slug ?? stream.created_at ?? stream.start_time ?? '');
+  const newSession = !sessionId || sessionId !== state.sessionId;
+
+  if (newSession) {
+    if (Date.now() - (state.announcedAt ?? 0) < LIVE_ANNOUNCE_COOLDOWN_MS) {
+      await writeLiveState({ live: true, sessionId });
+      return;
+    }
+    await pruneAnnouncements(true);
+    await sendAnnouncement(raw, sessionId, 0);
+    return;
+  }
+
+  await pruneAnnouncements();
+
+  const count = state.count ?? 1;
+  const withinWindow = Date.now() - (state.announcedAt ?? 0) < LIVE_ANNOUNCE_WINDOW_MS;
+  const spaced = Date.now() - (state.lastAnnouncedAt ?? state.announcedAt ?? 0) >= LIVE_ANNOUNCE_REPEAT_EVERY_MS;
+
+  if (count < LIVE_ANNOUNCE_REPEATS && withinWindow && spaced) {
+    await sendAnnouncement(raw, sessionId, count);
+    return;
+  }
+  if (!state.live) await writeLiveState({ live: true });
 }
 
 const KICK_ENDPOINTS = [
