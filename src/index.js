@@ -15,7 +15,7 @@ import {
   TICKET_TYPES,
 } from './tickets.js';
 import { getTicket, markClosed, markDeleted } from './ticketStore.js';
-import { startCodeStream, buildCodeMessage, expiredCodeMessage } from './codes.js';
+import { startCodeStream, buildCodeMessage, expiredCodeMessage, redeemInstructions } from './codes.js';
 import { getCodesState, setCodesChannel, filterNewCodes, markSeen, addPosted, takeExpiredPosts } from './codesStore.js';
 import {
   Client,
@@ -1409,6 +1409,15 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ ...payload, ephemeral: true });
       return;
     }
+    if (interaction.isButton() && interaction.customId.startsWith('codes_redeem:')) {
+      const [, slug, code] = interaction.customId.split(':');
+      const entry = { slug, code, casino: slug.replace(/us$/, ' US').replace(/^./, (c) => c.toUpperCase()) };
+      await interaction.reply(
+        redeemInstructions(entry, { redeemUrl: CODES_REDEEM_URL, emoji: casinoEmoji(slug) }),
+      );
+      return;
+    }
+
     if (interaction.isButton() && (interaction.customId === 'live_notify_toggle' || interaction.customId === 'codes_notify_toggle')) {
       const isCodes = interaction.customId === 'codes_notify_toggle';
       const roleId = isCodes ? CODES_PING_ROLE_ID : LIVE_PING_ROLE_ID;

@@ -141,7 +141,11 @@ export function buildCodeMessage(entry, { mention = '', redeemUrl = null, pingRo
   const row = new ActionRowBuilder();
   if (redeemUrl) {
     row.addComponents(
-      new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(`Redeem on ${entry.casino}`).setEmoji(emoji || '🎰').setURL(redeemUrl),
+      new ButtonBuilder()
+        .setCustomId(`codes_redeem:${entry.slug}:${entry.code}`.slice(0, 100))
+        .setStyle(ButtonStyle.Primary)
+        .setLabel(`Redeem on ${entry.casino}`)
+        .setEmoji(emoji || '🎰'),
     );
   }
   row.addComponents(
@@ -158,6 +162,28 @@ export function buildCodeMessage(entry, { mention = '', redeemUrl = null, pingRo
   }
 
   return { content: mention || undefined, embeds: [embed], components: [row] };
+}
+
+export function redeemInstructions(entry, { redeemUrl, emoji = '' } = {}) {
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`${emoji ? `${emoji} ` : ''}Redeem your ${entry.casino} code`)
+    .setDescription(
+      [
+        'Tap the code to copy it:',
+        `\`\`\`\n${entry.code}\n\`\`\``,
+        `**1.** Open ${entry.casino} with the button below (our partner link)`,
+        '**2.** Go to your profile → **Redeem code** / **Rewards**',
+        '**3.** Paste the code and confirm before it expires',
+      ].join('\n'),
+    )
+    .setFooter({ text: 'Only you can see this message' });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(`Open ${entry.casino}`).setEmoji('\ud83d\ude80').setURL(redeemUrl),
+  );
+
+  return { embeds: [embed], components: [row], ephemeral: true };
 }
 
 export function expiredCodeMessage(entry, { redeemUrl = null, emoji = '' } = {}) {
