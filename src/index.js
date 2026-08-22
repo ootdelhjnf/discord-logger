@@ -103,11 +103,12 @@ function socialField(user) {
 
 async function grantRole(member, roleId, reason) {
   if (!roleId) return null;
-  if (member.roles.cache.has(roleId)) return { ok: true, text: 'gia presente' };
 
   const role = member.guild.roles.cache.get(roleId)
     ?? (await member.guild.roles.fetch(roleId).catch(() => null));
   if (!role) return { ok: false, text: `ruolo ${roleId} inesistente` };
+
+  if (member.roles.cache.has(roleId)) return { ok: true, text: 'gia presente', role };
 
   const me = await member.guild.members.fetchMe();
   if (!me.permissions.has('ManageRoles')) {
@@ -426,7 +427,7 @@ function verificationMessage(link) {
   return { embeds: [embed], components: [row] };
 }
 
-function welcomeMessage(member, roleNames) {
+function welcomeMessage(member, roleNames, inviteUrl) {
   const embed = new EmbedBuilder()
     .setColor(0x22c55e)
     .setTitle('Verification complete')
@@ -435,12 +436,25 @@ function welcomeMessage(member, roleNames) {
     )
     .setThumbnail(member.guild.iconURL({ size: 256 }) ?? member.displayAvatarURL(VIEW))
     .addFields(
-      { name: 'Roles granted', value: roleNames.length ? roleNames.join('\n') : 'none', inline: true },
+      { name: 'Roles granted', value: roleNames.length ? roleNames.map((n) => `✅ ${n}`).join('\n') : 'none', inline: true },
       { name: 'Verified at', value: time(new Date(), 'f'), inline: true },
     )
     .setFooter({ text: 'Cousik Community' })
     .setTimestamp(new Date());
-  return { embeds: [embed] };
+
+  const components = inviteUrl
+    ? [
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setStyle(ButtonStyle.Link)
+            .setLabel('Go to the server')
+            .setEmoji('🏠')
+            .setURL(inviteUrl),
+        ),
+      ]
+    : [];
+
+  return { embeds: [embed], components };
 }
 
 async function startVerification(member) {
@@ -469,11 +483,15 @@ async function completeVerification(userId) {
 
   const failed = results.filter((r) => !r.outcome.ok);
   const ok = failed.length === 0 && results.length > 0;
-  const granted = results.filter((r) => r.outcome.ok).map((r) => `<@&${r.label === 'Member' ? AUTO_ROLE_ID : VERIFIED_ROLE_ID}>`);
+  const success = results.filter((r) => r.outcome.ok);
+  const grantedNames = success.map((r) => r.outcome.role.name);
+  const grantedMentions = success.map((r) => `<@&${r.outcome.role.id}>`);
+
+  const serverUrl = `https://discord.com/channels/${member.guild.id}`;
 
   let dmStatus = 'non inviata';
   try {
-    await member.send(welcomeMessage(member, granted));
+    await member.send(welcomeMessage(member, grantedNames, serverUrl));
     dmStatus = 'inviata in MP';
   } catch {
     dmStatus = 'MP chiusi';
@@ -485,7 +503,7 @@ async function completeVerification(userId) {
     .setDescription(`${member} — **${member.user.tag}**`)
     .setThumbnail(member.displayAvatarURL(VIEW))
     .addFields(
-      { name: 'Ruoli assegnati', value: granted.length ? granted.join(' ') : 'nessuno', inline: true },
+      { name: 'Ruoli assegnati', value: grantedMentions.length ? grantedMentions.join(' ') : 'nessuno', inline: true },
       { name: 'Conferma utente', value: dmStatus, inline: true },
     )
     .setFooter({ text: `ID: ${member.id}` })
