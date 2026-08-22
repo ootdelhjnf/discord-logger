@@ -520,6 +520,10 @@ function liveAllowedMentions() {
   return { parse: ['everyone'] };
 }
 
+function liveTopic() {
+  return `Automatic notifications when ${KICK_SLUG} goes live on Kick`;
+}
+
 async function lockAnnounceChannel(channel) {
   if (!LIVE_ANNOUNCE_LOCK) return;
   const me = await channel.guild.members.fetchMe().catch(() => null);
@@ -571,7 +575,10 @@ async function ensureAnnounceChannel(guild) {
 
   if (!channel) {
     const all = await guild.channels.fetch().catch(() => null);
-    channel = all?.find((c) => c?.type === ChannelType.GuildText && c.name === LIVE_ANNOUNCE_CHANNEL_NAME) ?? null;
+    channel = all?.find(
+      (c) => c?.type === ChannelType.GuildText
+        && (c.name === LIVE_ANNOUNCE_CHANNEL_NAME || c.topic === liveTopic()),
+    ) ?? null;
   }
 
   if (!channel) {
@@ -580,7 +587,7 @@ async function ensureAnnounceChannel(guild) {
         name: LIVE_ANNOUNCE_CHANNEL_NAME,
         type: ChannelType.GuildText,
         parent: LIVE_ANNOUNCE_CATEGORY_ID || undefined,
-        topic: `Automatic notifications when ${KICK_SLUG} goes live on Kick`,
+        topic: liveTopic(),
         reason: 'Canale dedicato agli annunci live',
       })
       .catch((err) => {
