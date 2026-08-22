@@ -186,6 +186,63 @@ export function redeemInstructions(entry, { redeemUrl, emoji = '' } = {}) {
   return { embeds: [embed], components: [row], ephemeral: true };
 }
 
+export function buildStatsMessage(stats, { emojiFor = () => '', brands = [] } = {}) {
+  const rows = Object.entries(stats.perCasino ?? {})
+    .sort((a, b) => b[1].value - a[1].value)
+    .map(([slug, data]) => {
+      const badge = emojiFor(slug) || '🎰';
+      return `${badge} **${data.casino}** — ${money(data.value)} in ${data.count} code${data.count === 1 ? '' : 's'}`;
+    });
+
+  const average = stats.totalCount ? stats.totalValue / stats.totalCount : 0;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xf59e0b)
+    .setTitle('📊 Code drops · live stats')
+    .setDescription(
+      [
+        '# ' + money(stats.totalValue),
+        `dropped in **${stats.totalCount}** code${stats.totalCount === 1 ? '' : 's'} since we started tracking`,
+        '',
+        rows.length ? rows.join('\n') : '_No code posted yet. The first drop will show up here._',
+      ].join('\n'),
+    )
+    .addFields(
+      { name: '🕒 Last 24h', value: `${money(stats.last24h?.value ?? 0)} · ${stats.last24h?.count ?? 0} codes`, inline: true },
+      { name: '📅 Last 7 days', value: `${money(stats.last7d?.value ?? 0)} · ${stats.last7d?.count ?? 0} codes`, inline: true },
+      { name: '📈 Average value', value: money(average), inline: true },
+    );
+
+  if (stats.biggest) {
+    embed.addFields({
+      name: '🏆 Biggest drop',
+      value: `${emojiFor(stats.biggest.slug) || '🎰'} **${money(stats.biggest.value)}** · \`${stats.biggest.code}\` · <t:${Math.floor(stats.biggest.ts / 1000)}:R>`,
+      inline: false,
+    });
+  }
+
+  embed
+    .addFields({
+      name: '⚡ Last drop',
+      value: stats.lastAt ? `<t:${Math.floor(stats.lastAt / 1000)}:R>` : 'never',
+      inline: true,
+    })
+    .setFooter({ text: `Tracking: ${brands.join(', ') || 'all brands'} · updates automatically` })
+    .setTimestamp(new Date());
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Live codes feed').setEmoji('📡').setURL('https://www.fairgambling.com/livecodes'),
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+export function statsChannelName(stats) {
+  const total = stats.totalValue ?? 0;
+  const label = total >= 1000 ? `${(total / 1000).toFixed(1).replace('.', '-')}k` : `${Math.round(total)}`;
+  return `💰・${label}-ᴜsᴅ-ᴅʀᴏᴘᴘᴇᴅ`;
+}
+
 export function expiredCodeMessage(entry, { redeemUrl = null, emoji = '' } = {}) {
   const badge = emoji ? `${emoji} ` : '';
   const embed = new EmbedBuilder()

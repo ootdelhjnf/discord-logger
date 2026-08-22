@@ -15,8 +15,18 @@ import {
   TICKET_TYPES,
 } from './tickets.js';
 import { getTicket, markClosed, markDeleted } from './ticketStore.js';
-import { startCodeStream, buildCodeMessage, expiredCodeMessage, redeemInstructions } from './codes.js';
-import { getCodesState, setCodesChannel, filterNewCodes, markSeen, addPosted, takeExpiredPosts } from './codesStore.js';
+import { startCodeStream, buildCodeMessage, expiredCodeMessage, redeemInstructions, buildStatsMessage, statsChannelName } from './codes.js';
+import {
+  getCodesState,
+  setCodesChannel,
+  filterNewCodes,
+  markSeen,
+  addPosted,
+  takeExpiredPosts,
+  setStatsChannel,
+  recordDrop,
+  getDropStats,
+} from './codesStore.js';
 import {
   Client,
   GatewayIntentBits,
@@ -74,8 +84,14 @@ const CODES_REDEEM_URL = process.env.CODES_REDEEM_URL || 'https://shuffle.com';
 const CODES_TOPIC = 'Automatic Shuffle code drops from fairgambling.com/livecodes';
 const CODES_WEBHOOK_NAME = process.env.CODES_WEBHOOK_NAME || 'Code Drops';
 const CODES_WEBHOOK_ENABLED = process.env.CODES_WEBHOOK !== 'false';
+const CODES_STATS_ENABLED = process.env.CODES_STATS !== 'false';
+const CODES_STATS_CHANNEL_ID = process.env.CODES_STATS_CHANNEL_ID;
+const CODES_STATS_TOPIC = 'Live totals of every code drop posted by the bot';
 let codesChannelId = null;
 let codesWebhook = null;
+let statsChannelId = null;
+let statsMessageId = null;
+let lastStatsRenameAt = 0;
 const codeMessageIds = new Set();
 
 const TICKET_CONFIG = {
@@ -278,6 +294,8 @@ client.once('clientReady', async () => {
   if (CODES_ENABLED) {
     await ensureCodesChannel(guild);
     if (codesChannelId) {
+      await ensureStatsChannel(guild);
+      setInterval(() => updateStatsPanel().catch(() => null), 15 * 60 * 1000).unref?.();
       const state = await getCodesState();
       for (const post of state.posted ?? []) codeMessageIds.add(post.id);
       await sweepExpiredCodes();
@@ -801,6 +819,84 @@ async function ensureCodesChannel(guild) {
   await setCodesChannel(channel.id);
 }
 
+async function ensureStatsChannel(guild) {
+  if (!CODES_STATS_ENABLED) return;
+
+  const state = await getCodesState();
+  let channel = null;
+
+  if (CODES_STATS_CHANNEL_ID) channel = await guild.channels.fetch(CODES_STATS_CHANNEL_ID).catch(() => null);
+  if (!channel && state.statsChannelId) channel = await guild.channels.fetch(state.statsChannelId).catch(() => null);
+  if (!channel) {
+    const all = await guild.channels.fetch().catch(() => null);
+    channel = all?.find((c) => c?.type === ChannelType.GuildText && c.topic === CODES_STATS_TOPIC) ?? null;
+  }
+
+  if (!channel) {
+    const dropsChannel = codesChannelId ? await guild.channels.fetch(codesChannelId).catch(() => null) : null;
+    channel = await guild.channels
+      .create({
+        name: statsChannelName(await getDropStats()),
+        type: ChannelType.GuildText,
+        parent: dropsChannel?.parentId ?? CODES_CATEGORY_ID ?? undefined,
+        position: dropsChannel ? dropsChannel.rawPosition + 1 : undefined,
+        topic: CODES_STATS_TOPIC,
+        reason: 'Statistiche dei code drop',
+      })
+      .catch((err) => {
+        console.error('Creazione canale statistiche fallita:', err.message);
+        return null;
+      });
+    if (channel) console.log(`canale statistiche creato: #${channel.name} (${channel.id})`);
+  }
+
+  if (!channel) return;
+  await lockReadOnlyChannel(channel);
+  statsChannelId = channel.id;
+  statsMessageId = state.statsMessageId ?? null;
+  await setStatsChannel(channel.id, statsMessageId);
+  await updateStatsPanel();
+}
+
+async function updateStatsPanel() {
+  if (!statsChannelId) return;
+
+  const channel = await client.channels.fetch(statsChannelId).catch(() => null);
+  if (!channel?.isTextBased()) return;
+
+  const stats = await getDropStats();
+  const payload = buildStatsMessage(stats, { emojiFor: casinoEmoji, brands: CODES_BRANDS });
+
+  let message = statsMessageId ? await channel.messages.fetch(statsMessageId).catch(() => null) : null;
+  if (!message) {
+    const recent = await channel.messages.fetch({ limit: 20 }).catch(() => null);
+    message = recent?.find((m) => m.author.id === client.user.id && m.embeds.length) ?? null;
+  }
+
+  if (message) {
+    await message.edit(payload).catch((err) => console.error('Aggiornamento statistiche fallito:', err.message));
+  } else {
+    const sent = await channel.send(payload).catch((err) => {
+      console.error('Invio statistiche fallito:', err.message);
+      return null;
+    });
+    if (!sent) return;
+    message = sent;
+    await sent.pin().catch(() => null);
+  }
+
+  if (message.id !== statsMessageId) {
+    statsMessageId = message.id;
+    await setStatsChannel(statsChannelId, statsMessageId);
+  }
+
+  const name = statsChannelName(stats);
+  if (channel.name !== name && Date.now() - lastStatsRenameAt >= RENAME_MIN_INTERVAL_MS) {
+    const renamed = await channel.setName(name, 'Totale code drop aggiornato').catch(() => null);
+    if (renamed) lastStatsRenameAt = Date.now();
+  }
+}
+
 function codesMention() {
   if (CODES_PING_ROLE_ID) return `<@&${CODES_PING_ROLE_ID}>`;
   if (CODES_MENTION === 'everyone') return '@everyone';
@@ -879,6 +975,8 @@ async function postCode(entry) {
   if (!sent) return;
 
   codeMessageIds.add(sent.id);
+  await recordDrop(entry);
+  await updateStatsPanel();
   await addPosted({
     channelId: sent.channel_id ?? sent.channelId ?? channel.id,
     id: sent.id,
