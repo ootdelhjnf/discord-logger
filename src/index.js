@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createVerification, handleVerify, pendingCount } from './verify.js';
 import {
   Client,
   GatewayIntentBits,
@@ -15,6 +16,8 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
+const VERIFY_ENABLED = process.env.VERIFY_ENABLED === 'true';
+const PUBLIC_URL = (process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || '').replace(/\/$/, '');
 
 if (!TOKEN || !GUILD_ID || !LOG_CHANNEL_ID) {
   console.error('Mancano DISCORD_TOKEN, GUILD_ID o LOG_CHANNEL_ID nel file .env');
@@ -207,7 +210,10 @@ client.on('guildMemberAdd', async (member) => {
     embed.addFields({ name: 'Attenzione', value: 'Account molto recente', inline: true });
   }
 
-  if (!member.pending) {
+  if (VERIFY_ENABLED) {
+    const outcome = await startVerification(member);
+    embed.addFields({ name: 'Verifica captcha', value: outcome });
+  } else if (!member.pending) {
     const auto = await assignAutoRole(member);
     if (auto) {
       embed.addFields({ name: auto.ok ? 'Ruolo automatico' : 'Ruolo automatico fallito', value: auto.text });
@@ -395,6 +401,57 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   await send(embed, buttons);
 });
 
+function verificationMessage(link) {
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('Verifica richiesta')
+    .setDescription(
+      'Per accedere a **Cousik Community** devi completare una breve verifica anti-bot.\n\nApri il link, digita il codice che vedi e otterrai subito l’accesso.',
+    )
+    .addFields({ name: 'Validita', value: 'Il link scade tra 15 minuti' })
+    .setFooter({ text: 'Se il link scade usa /verifica nel server' });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Verificami').setEmoji('🛡️').setURL(link),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+async function startVerification(member) {
+  if (!PUBLIC_URL) return 'non configurata: manca PUBLIC_URL';
+  const token = createVerification(member.id, member.user.username);
+  const link = `${PUBLIC_URL}/verify/${token}`;
+  try {
+    await member.send(verificationMessage(link));
+    return 'link inviato in messaggio privato';
+  } catch {
+    return 'MP chiusi: deve usare il comando `/verifica` nel server';
+  }
+}
+
+async function completeVerification(userId) {
+  const guild = client.guilds.cache.get(GUILD_ID);
+  if (!guild) return { ok: false, message: 'server non raggiungibile' };
+
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) return { ok: false, message: 'non risulti piu nel server' };
+
+  const auto = await assignAutoRole(member);
+  const ok = Boolean(auto?.ok);
+
+  const embed = new EmbedBuilder()
+    .setColor(ok ? 0x22c55e : 0xe67e22)
+    .setTitle(ok ? 'Captcha superato' : 'Captcha superato ma ruolo non assegnato')
+    .setDescription(`${member} — **${member.user.tag}**`)
+    .setThumbnail(member.displayAvatarURL(VIEW))
+    .addFields({ name: 'Esito', value: auto?.text ?? 'nessun ruolo configurato' })
+    .setFooter({ text: `ID: ${member.id}` })
+    .setTimestamp(new Date());
+  await send(embed);
+
+  return { ok, message: auto?.text ?? 'nessun ruolo configurato' };
+}
+
 const PAGE_SIZE = 20;
 
 async function membersPage(guild, page) {
@@ -453,6 +510,20 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.editReply(payload);
       return;
     }
+    if (interaction.isChatInputCommand() && interaction.commandName === 'verifica') {
+      if (!PUBLIC_URL) {
+        await interaction.reply({ content: 'Verifica non configurata.', ephemeral: true });
+        return;
+      }
+      if (AUTO_ROLE_ID && interaction.member.roles.cache.has(AUTO_ROLE_ID)) {
+        await interaction.reply({ content: 'Risulti gia verificato.', ephemeral: true });
+        return;
+      }
+      const token = createVerification(interaction.user.id, interaction.user.username);
+      const payload = verificationMessage(`${PUBLIC_URL}/verify/${token}`);
+      await interaction.reply({ ...payload, ephemeral: true });
+      return;
+    }
     if (interaction.isButton() && interaction.customId.startsWith('membri:')) {
       await interaction.deferUpdate();
       const page = Number(interaction.customId.split(':')[1]) || 0;
@@ -469,7 +540,16 @@ const startedAt = new Date();
 let pingCount = 0;
 let lastPingAt = null;
 
-createServer((req, res) => {
+createServer(async (req, res) => {
+  const pathname = new URL(req.url, 'http://localhost').pathname;
+  if (pathname.startsWith('/verify/')) {
+    await handleVerify(req, res, pathname, completeVerification).catch(() => {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('errore interno');
+    });
+    return;
+  }
+
   pingCount += 1;
   lastPingAt = new Date();
   const ready = client.isReady();
@@ -486,6 +566,8 @@ createServer((req, res) => {
       startedAt: startedAt.toISOString(),
       pingCount,
       lastPingAt: lastPingAt.toISOString(),
+      verifyEnabled: VERIFY_ENABLED,
+      verifyPending: pendingCount(),
     }),
   );
 }).listen(PORT, () => console.log(`Keep-alive HTTP in ascolto sulla porta ${PORT}`));
