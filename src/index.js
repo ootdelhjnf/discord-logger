@@ -18,6 +18,10 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
 const VERIFIED_ROLE_ID = process.env.VERIFIED_ROLE_ID;
 const VERIFY_ENABLED = process.env.VERIFY_ENABLED === 'true';
+const NO_REACTION_CHANNELS = (process.env.NO_REACTION_CHANNELS || '')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean);
 const PUBLIC_URL = (process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || '').replace(/\/$/, '');
 
 if (!TOKEN || !GUILD_ID || !LOG_CHANNEL_ID) {
@@ -33,8 +37,9 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.GuildMessageReactions,
   ],
-  partials: [Partials.GuildMember, Partials.User],
+  partials: [Partials.GuildMember, Partials.User, Partials.Message, Partials.Reaction, Partials.Channel],
 });
 
 async function getLogChannel() {
@@ -639,6 +644,19 @@ createServer(async (req, res) => {
     }),
   );
 }).listen(PORT, () => console.log(`Keep-alive HTTP in ascolto sulla porta ${PORT}`));
+
+client.on('messageReactionAdd', async (reaction, user) => {
+  if (user.bot) return;
+  if (!NO_REACTION_CHANNELS.includes(reaction.message.channelId)) return;
+
+  try {
+    if (reaction.partial) await reaction.fetch();
+    await reaction.users.remove(user.id);
+    console.log(`reazione rimossa: ${user.tag ?? user.id} in ${reaction.message.channelId}`);
+  } catch (err) {
+    console.error('Rimozione reazione fallita:', err.message);
+  }
+});
 
 client.on('error', (err) => console.error('Errore client:', err.message));
 process.on('unhandledRejection', (err) => console.error('Promise non gestita:', err));
