@@ -121,18 +121,19 @@ export function startCodeStream({ onCodes, onLog = () => {}, pollMs = 60_000 }) 
   };
 }
 
-export function buildCodeMessage(entry, { mention = '', redeemUrl = null, pingRoleId = null } = {}) {
+export function buildCodeMessage(entry, { mention = '', redeemUrl = null, pingRoleId = null, emoji = '' } = {}) {
+  const badge = emoji ? `${emoji} ` : '';
   const embed = new EmbedBuilder()
     .setColor(0x22c55e)
     .setTitle(`🎁 New ${entry.casino} code drop`)
-    .setDescription(`## \`${entry.code}\`\nCopy it and redeem it **right now**, these drops last only a few minutes.`)
+    .setDescription(`${badge}**${entry.casino}** just dropped a code\n## \`${entry.code}\`\nCopy it and redeem it **right now**, these drops last only a few minutes.`)
     .addFields(
       { name: '💰 Value', value: money(entry.value), inline: true },
       { name: '🎫 Total claims', value: entry.claims ? entry.claims.toLocaleString('en-US') : '—', inline: true },
       { name: '🎯 Wager req', value: entry.wager ? `${money(entry.wager)}${entry.wagerTimeframe ? ` · ${entry.wagerTimeframe}` : ''}` : '—', inline: true },
       { name: '📊 Value per 1K', value: valuePer1k(entry), inline: true },
       { name: '⏳ Expires', value: entry.endAt ? `<t:${Math.floor(entry.endAt / 1000)}:R>` : 'unknown', inline: true },
-      { name: '🏷️ Casino', value: entry.casino, inline: true },
+      { name: '🏷️ Casino', value: `${badge}${entry.casino}`, inline: true },
     )
     .setFooter({ text: 'Source: fairgambling.com/livecodes' })
     .setTimestamp(new Date(entry.createdAt));
@@ -140,7 +141,7 @@ export function buildCodeMessage(entry, { mention = '', redeemUrl = null, pingRo
   const row = new ActionRowBuilder();
   if (redeemUrl) {
     row.addComponents(
-      new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(`Redeem on ${entry.casino}`).setEmoji('🎰').setURL(redeemUrl),
+      new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(`Redeem on ${entry.casino}`).setEmoji(emoji || '🎰').setURL(redeemUrl),
     );
   }
   row.addComponents(
@@ -159,11 +160,12 @@ export function buildCodeMessage(entry, { mention = '', redeemUrl = null, pingRo
   return { content: mention || undefined, embeds: [embed], components: [row] };
 }
 
-export function expiredCodeMessage(entry, { redeemUrl = null } = {}) {
+export function expiredCodeMessage(entry, { redeemUrl = null, emoji = '' } = {}) {
+  const badge = emoji ? `${emoji} ` : '';
   const embed = new EmbedBuilder()
     .setColor(0x4b5563)
     .setTitle(`⌛ ${entry.casino} code expired`)
-    .setDescription(`~~\`${entry.code}\`~~\nThis drop is over. Stay tuned, a new one lands soon.`)
+    .setDescription(`${badge}~~\`${entry.code}\`~~\nThis drop is over. Stay tuned, a new one lands soon.`)
     .addFields(
       { name: '💰 Value', value: money(entry.value), inline: true },
       { name: '🎫 Total claims', value: entry.claims ? entry.claims.toLocaleString('en-US') : '—', inline: true },
@@ -177,7 +179,7 @@ export function expiredCodeMessage(entry, { redeemUrl = null } = {}) {
   );
   if (redeemUrl) {
     row.addComponents(
-      new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(`Go to ${entry.casino}`).setEmoji('🎰').setURL(redeemUrl),
+      new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(`Go to ${entry.casino}`).setEmoji(emoji || '🎰').setURL(redeemUrl),
     );
   }
 

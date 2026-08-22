@@ -811,6 +811,10 @@ function codesAllowedMentions() {
   return { parse: [] };
 }
 
+function casinoEmoji(slug) {
+  return client.emojis.cache.find((e) => e.name === slug)?.toString() ?? '';
+}
+
 async function postCode(entry) {
   const channel = await client.channels.fetch(codesChannelId).catch(() => null);
   if (!channel?.isTextBased()) return;
@@ -819,6 +823,7 @@ async function postCode(entry) {
     mention: codesMention(),
     redeemUrl: CODES_REDEEM_URL,
     pingRoleId: CODES_PING_ROLE_ID,
+    emoji: casinoEmoji(entry.slug),
   });
 
   const sent = await channel
@@ -847,7 +852,10 @@ async function sweepExpiredCodes() {
     const message = await channel?.messages?.fetch(post.id).catch(() => null);
     if (!message) continue;
     await message
-      .edit({ ...expiredCodeMessage(post.entry, { redeemUrl: CODES_REDEEM_URL }), allowedMentions: { parse: [] } })
+      .edit({
+        ...expiredCodeMessage(post.entry, { redeemUrl: CODES_REDEEM_URL, emoji: casinoEmoji(post.entry?.slug) }),
+        allowedMentions: { parse: [] },
+      })
       .catch(() => null);
   }
 }
