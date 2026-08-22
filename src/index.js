@@ -423,15 +423,38 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
 let kickState = { followers: null, live: false, name: null, updatedAt: null };
 
+const KICK_ENDPOINTS = [
+  (slug) => `https://kick.com/api/v2/channels/${slug}`,
+  (slug) => `https://kick.com/api/v1/channels/${slug}`,
+];
+
 async function fetchKickChannel() {
-  const res = await fetch(`https://kick.com/api/v2/channels/${KICK_SLUG}`, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
-      Accept: 'application/json',
-    },
-  });
-  if (!res.ok) throw new Error(`Kick ha risposto ${res.status}`);
-  return res.json();
+  const errors = [];
+  for (const build of KICK_ENDPOINTS) {
+    const url = build(KICK_SLUG);
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          Accept: 'application/json, text/plain, */*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Referer: `https://kick.com/${KICK_SLUG}`,
+        },
+      });
+      const body = await res.text();
+      if (!res.ok) {
+        errors.push(`${res.status} su ${url}: ${body.slice(0, 90)}`);
+        continue;
+      }
+      const data = JSON.parse(body);
+      if (typeof data?.followers_count === 'number') return data;
+      errors.push(`campo mancante su ${url}: ${body.slice(0, 90)}`);
+    } catch (err) {
+      errors.push(`${url}: ${err.message.slice(0, 90)}`);
+    }
+  }
+  throw new Error(errors.join(' | '));
 }
 
 async function updateKickCounter() {
@@ -445,8 +468,7 @@ async function updateKickCounter() {
     return;
   }
 
-  const followers = data?.followers_count;
-  if (typeof followers !== 'number') return;
+  const followers = data.followers_count;
 
   const live = Boolean(data.livestream);
   const name = `${live ? '🔴' : '🟢'}・𝗞𝗜𝗖𝗞: ${followers.toLocaleString('en-US')}`;
