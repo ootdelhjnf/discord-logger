@@ -465,15 +465,27 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 const PORT = process.env.PORT || 3000;
+const startedAt = new Date();
+let pingCount = 0;
+let lastPingAt = null;
+
 createServer((req, res) => {
+  pingCount += 1;
+  lastPingAt = new Date();
   const ready = client.isReady();
+  const agent = req.headers['user-agent'] ?? 'sconosciuto';
+  console.log(`ping #${pingCount} da ${agent.slice(0, 60)}`);
   res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
   res.end(
     JSON.stringify({
       status: ready ? 'online' : 'connecting',
       bot: client.user?.tag ?? null,
       guilds: client.guilds.cache.size,
+      members: client.guilds.cache.get(GUILD_ID)?.memberCount ?? null,
       uptimeSeconds: Math.floor(process.uptime()),
+      startedAt: startedAt.toISOString(),
+      pingCount,
+      lastPingAt: lastPingAt.toISOString(),
     }),
   );
 }).listen(PORT, () => console.log(`Keep-alive HTTP in ascolto sulla porta ${PORT}`));
