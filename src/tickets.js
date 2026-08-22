@@ -11,6 +11,7 @@ import {
   PermissionFlagsBits,
   ChannelType,
 } from 'discord.js';
+import { recordTicket, listUserTickets, userStats } from './ticketStore.js';
 
 export const TICKET_TYPES = {
   website: {
@@ -88,13 +89,151 @@ export function buildPanel(imageName) {
     .setFooter({ text: 'Cousik Community · Support' })
     .setTimestamp(new Date());
 
-  const button = new ButtonBuilder()
+  const open = new ButtonBuilder()
     .setCustomId('ticket_open')
     .setStyle(ButtonStyle.Primary)
     .setLabel('Open a ticket')
     .setEmoji('🎫');
 
-  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(button)] };
+  const history = new ButtonBuilder()
+    .setCustomId('ticket_history')
+    .setStyle(ButtonStyle.Secondary)
+    .setLabel('My past tickets')
+    .setEmoji('📁');
+
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(open, history)] };
+}
+
+export const TICKET_STATUS = {
+  open: { emoji: '🟢', label: 'Open', colour: 0x3b82f6 },
+  resolved: { emoji: '✅', label: 'Resolved', colour: 0x22c55e },
+  unresolved: { emoji: '❌', label: 'Closed without solution', colour: 0xef4444 },
+};
+
+const HISTORY_PAGE_SIZE = 5;
+
+function statusOf(entry) {
+  return TICKET_STATUS[entry.status] ?? TICKET_STATUS.open;
+}
+
+function stamp(ms, style = 'f') {
+  if (!ms) return 'unknown';
+  return `<t:${Math.floor(ms / 1000)}:${style}>`;
+}
+
+function typeOf(entry) {
+  return TICKET_TYPES[entry.type] ?? { label: entry.type ?? 'unknown', emoji: '🎫', colour: 0x5865f2 };
+}
+
+export async function historyMessage(userId, page = 0, viewerIsOwner = true) {
+  const entries = await listUserTickets(userId);
+  const stats = await userStats(userId);
+  const pages = Math.max(1, Math.ceil(entries.length / HISTORY_PAGE_SIZE));
+  const current = Math.min(Math.max(page, 0), pages - 1);
+  const slice = entries.slice(current * HISTORY_PAGE_SIZE, current * HISTORY_PAGE_SIZE + HISTORY_PAGE_SIZE);
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(viewerIsOwner ? '📁 Your past tickets' : '📁 Ticket history')
+    .setDescription(
+      entries.length
+        ? slice
+            .map((e) => {
+              const s = statusOf(e);
+              const t = typeOf(e);
+              const closed = e.closedAt ? ` · closed ${stamp(e.closedAt, 'R')}` : '';
+              return [
+                `${s.emoji} **${e.subject || 'no subject'}**`,
+                `${t.emoji} ${t.label} · opened ${stamp(e.openedAt, 'R')}${closed}`,
+                `Status: **${s.label}**${e.resolution ? ` · ${e.resolution}` : ''}`,
+              ].join('\n');
+            })
+            .join('\n\n')
+        : 'No ticket has been opened yet with this account.',
+    )
+    .addFields(
+      { name: 'Total', value: `${stats.total}`, inline: true },
+      { name: '✅ Resolved', value: `${stats.resolved}`, inline: true },
+      { name: '❌ Not resolved', value: `${stats.unresolved}`, inline: true },
+    )
+    .setFooter({ text: `Page ${current + 1} of ${pages} · pick a ticket below to see the full details` })
+    .setTimestamp(new Date());
+
+  const components = [];
+
+  if (slice.length) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(`ticket_history_view:${userId}:${current}`)
+      .setPlaceholder('Open the details of a ticket')
+      .addOptions(
+        slice.map((e) => ({
+          value: e.id,
+          label: (e.subject || 'no subject').slice(0, 90),
+          description: `${statusOf(e).label} · ${typeOf(e).label}`.slice(0, 90),
+          emoji: statusOf(e).emoji,
+        })),
+      );
+    components.push(new ActionRowBuilder().addComponents(menu));
+  }
+
+  if (pages > 1) {
+    components.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ticket_history:${userId}:${current - 1}`)
+          .setStyle(ButtonStyle.Secondary)
+          .setLabel('Previous')
+          .setEmoji('⬅️')
+          .setDisabled(current === 0),
+        new ButtonBuilder()
+          .setCustomId(`ticket_history:${userId}:${current + 1}`)
+          .setStyle(ButtonStyle.Secondary)
+          .setLabel('Next')
+          .setEmoji('➡️')
+          .setDisabled(current >= pages - 1),
+      ),
+    );
+  }
+
+  return { embeds: [embed], components };
+}
+
+export function ticketDetailMessage(entry, backTarget) {
+  const s = statusOf(entry);
+  const t = typeOf(entry);
+
+  const embed = new EmbedBuilder()
+    .setColor(s.colour)
+    .setTitle(`${s.emoji} ${entry.subject || 'no subject'}`)
+    .addFields(
+      { name: 'Category', value: `${t.emoji} ${t.label}`, inline: true },
+      { name: 'Status', value: s.label, inline: true },
+      { name: 'Ticket ID', value: `\`${entry.id}\``, inline: true },
+      { name: 'Opened', value: stamp(entry.openedAt), inline: true },
+      { name: 'Closed', value: entry.closedAt ? stamp(entry.closedAt) : 'still open', inline: true },
+      { name: 'Closed by', value: entry.closedBy ? `<@${entry.closedBy}>` : '—', inline: true },
+    )
+    .setTimestamp(new Date());
+
+  if (entry.details) embed.addFields({ name: 'What you wrote', value: entry.details.slice(0, 1024) });
+  if (entry.casino) embed.addFields({ name: 'Casino support contacted', value: entry.casino.slice(0, 1024) });
+  if (entry.account) embed.addFields({ name: 'Username on the site', value: entry.account.slice(0, 256), inline: true });
+  if (entry.resolution) embed.addFields({ name: 'Staff outcome', value: entry.resolution.slice(0, 1024) });
+  embed.addFields({
+    name: 'Channel',
+    value: entry.channelDeleted ? 'deleted by the staff' : `<#${entry.id}>`,
+    inline: true,
+  });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`ticket_history:${backTarget.userId}:${backTarget.page}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setLabel('Back to the list')
+      .setEmoji('↩️'),
+  );
+
+  return { embeds: [embed], components: [row] };
 }
 
 export function categoryChooser() {
@@ -255,12 +394,27 @@ export async function createTicket(interaction, config, answers, typeKey) {
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('ticket_close').setStyle(ButtonStyle.Danger).setLabel('Close ticket').setEmoji('🔒'),
     new ButtonBuilder().setCustomId('ticket_claim').setStyle(ButtonStyle.Secondary).setLabel('Claim').setEmoji('🙋'),
+    new ButtonBuilder().setCustomId(`ticket_history:${user.id}:0`).setStyle(ButtonStyle.Secondary).setLabel('Past tickets').setEmoji('📁'),
   );
 
   await channel.send({
     content: `${user} ${config.staffRoles.map((id) => `<@&${id}>`).join(' ')}`,
     embeds: [embed],
     components: [buttons],
+  });
+
+  await recordTicket({
+    id: channel.id,
+    guildId: guild.id,
+    userId: user.id,
+    userTag: user.tag,
+    type: typeKey,
+    subject: answers.subject,
+    details: answers.details,
+    casino: answers.casino || null,
+    account: answers.account || null,
+    channelName: channel.name,
+    openedAt: Date.now(),
   });
 
   return { ok: true, channel, type };
@@ -296,24 +450,39 @@ export function closeConfirmMessage() {
   const embed = new EmbedBuilder()
     .setColor(0xef4444)
     .setTitle('Close this ticket?')
-    .setDescription('The channel will be locked and archived. A transcript is saved for the staff.');
+    .setDescription(
+      'The channel will be locked and archived. A transcript is saved for the staff.\n\nPick the outcome: it is stored in the ticket history so you can always check later if the issue was solved.',
+    );
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket_close_confirm').setStyle(ButtonStyle.Danger).setLabel('Yes, close it').setEmoji('🔒'),
+    new ButtonBuilder().setCustomId('ticket_close_confirm:resolved').setStyle(ButtonStyle.Success).setLabel('Close as resolved').setEmoji('✅'),
+    new ButtonBuilder().setCustomId('ticket_close_confirm:unresolved').setStyle(ButtonStyle.Danger).setLabel('Close without solution').setEmoji('❌'),
     new ButtonBuilder().setCustomId('ticket_close_cancel').setStyle(ButtonStyle.Secondary).setLabel('Cancel'),
   );
   return { embeds: [embed], components: [row], ephemeral: true };
 }
 
-export function archivedMessage(closer) {
+export function archivedMessage(closer, resolved, ownerId) {
+  const status = resolved ? TICKET_STATUS.resolved : TICKET_STATUS.unresolved;
   const embed = new EmbedBuilder()
-    .setColor(0x6b7280)
-    .setTitle('🔒 Ticket closed')
-    .setDescription(`Closed by ${closer}. The channel is now read-only and archived.`)
+    .setColor(status.colour)
+    .setTitle(`🔒 Ticket closed · ${status.emoji} ${status.label}`)
+    .setDescription(
+      `Closed by ${closer}. The channel is now read-only and archived.\n\nThis ticket stays in the history: use **My past tickets** on the support panel to read it again.`,
+    )
     .setTimestamp(new Date());
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('ticket_delete').setStyle(ButtonStyle.Danger).setLabel('Delete channel').setEmoji('🗑️'),
   );
+  if (ownerId) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`ticket_history:${ownerId}:0`)
+        .setStyle(ButtonStyle.Secondary)
+        .setLabel('Past tickets')
+        .setEmoji('📁'),
+    );
+  }
   return { embeds: [embed], components: [row] };
 }

@@ -2,3 +2,4 @@ node_modules/
 .env
 backup-permessi-stream.json
 backup-pannello-ticket-vecchio.json
+data/

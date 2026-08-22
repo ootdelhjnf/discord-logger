@@ -9,8 +9,11 @@ import {
   closeConfirmMessage,
   archivedMessage,
   categoryChooser,
+  historyMessage,
+  ticketDetailMessage,
   TICKET_TYPES,
 } from './tickets.js';
+import { getTicket, markClosed, markDeleted } from './ticketStore.js';
 import {
   Client,
   GatewayIntentBits,
@@ -20,6 +23,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   AuditLogEvent,
+  MessageFlags,
   time,
 } from 'discord.js';
 
@@ -692,7 +696,7 @@ async function ticketLog(embed, files = []) {
   await channel.send({ embeds: [embed], files }).catch((err) => console.error('Log ticket fallito:', err.message));
 }
 
-async function archiveTicket(interaction) {
+async function archiveTicket(interaction, resolved) {
   const channel = interaction.channel;
   const ownerId = channel.topic?.match(/owner:(\d+)/)?.[1];
 
@@ -706,23 +710,66 @@ async function archiveTicket(interaction) {
   }
   await channel.setName(`closed-${channel.name.replace(/^ticket-/, '')}`.slice(0, 100)).catch(() => null);
 
+  await markClosed(channel.id, {
+    resolved,
+    closedBy: interaction.user.id,
+    closedByTag: interaction.user.tag,
+    resolution: resolved
+      ? `Marked as resolved by ${interaction.user.tag}`
+      : `Closed without a solution by ${interaction.user.tag}`,
+  });
+
   const embed = new EmbedBuilder()
-    .setColor(0x6b7280)
+    .setColor(resolved ? 0x22c55e : 0xef4444)
     .setTitle('🔒 Ticket chiuso')
     .addFields(
       { name: 'Canale', value: `${channel}`, inline: true },
       { name: 'Chiuso da', value: `${interaction.user}`, inline: true },
       { name: 'Proprietario', value: ownerId ? `<@${ownerId}>` : 'sconosciuto', inline: true },
+      { name: 'Esito', value: resolved ? '✅ Risolto' : '❌ Chiuso senza soluzione', inline: true },
     )
     .setTimestamp(new Date());
 
   await ticketLog(embed, [transcript]);
-  await channel.send(archivedMessage(interaction.user));
+  await channel.send(archivedMessage(interaction.user, resolved, ownerId));
 }
 
 async function handleTicketInteraction(interaction) {
   if (interaction.isButton() && interaction.customId === 'ticket_open') {
     await interaction.reply(categoryChooser());
+    return true;
+  }
+
+  if (interaction.isButton() && interaction.customId.startsWith('ticket_history')) {
+    const [, rawUser, rawPage] = interaction.customId.split(':');
+    const targetId = rawUser || interaction.user.id;
+    if (targetId !== interaction.user.id && !isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'You can only see your own tickets.', ephemeral: true });
+      return true;
+    }
+    const page = Number(rawPage) || 0;
+    const payload = await historyMessage(targetId, page, targetId === interaction.user.id);
+    if (interaction.message?.flags?.has?.(MessageFlags.Ephemeral)) await interaction.update(payload);
+    else await interaction.reply({ ...payload, ephemeral: true });
+    return true;
+  }
+
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith('ticket_history_view:')) {
+    const [, targetId, rawPage] = interaction.customId.split(':');
+    if (targetId !== interaction.user.id && !isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'You can only see your own tickets.', ephemeral: true });
+      return true;
+    }
+    const entry = await getTicket(interaction.values[0]);
+    if (!entry) {
+      await interaction.reply({ content: 'This ticket is no longer in the history.', ephemeral: true });
+      return true;
+    }
+    if (entry.userId !== interaction.user.id && !isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'You can only see your own tickets.', ephemeral: true });
+      return true;
+    }
+    await interaction.update(ticketDetailMessage(entry, { userId: targetId, page: Number(rawPage) || 0 }));
     return true;
   }
 
@@ -782,9 +829,10 @@ async function handleTicketInteraction(interaction) {
     return true;
   }
 
-  if (interaction.isButton() && interaction.customId === 'ticket_close_confirm') {
+  if (interaction.isButton() && interaction.customId.startsWith('ticket_close_confirm')) {
+    const resolved = interaction.customId.split(':')[1] !== 'unresolved';
     await interaction.update({ content: 'Closing the ticket...', embeds: [], components: [] });
-    await archiveTicket(interaction);
+    await archiveTicket(interaction, resolved);
     return true;
   }
 
@@ -794,6 +842,7 @@ async function handleTicketInteraction(interaction) {
       return true;
     }
     const name = interaction.channel.name;
+    await markDeleted(interaction.channel.id, interaction.user.id);
     await interaction.reply({ content: 'Deleting in 5 seconds...' });
     setTimeout(() => {
       interaction.channel.delete('Ticket eliminato dallo staff').catch(() => null);
