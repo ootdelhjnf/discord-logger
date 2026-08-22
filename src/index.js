@@ -1,6 +1,15 @@
 import { createServer } from 'node:http';
 import { createVerification, handleVerify, pendingCount } from './verify.js';
 import {
+  buildPanel,
+  buildModal,
+  createTicket,
+  buildTranscript,
+  closeConfirmMessage,
+  archivedMessage,
+  TICKET_TYPES,
+} from './tickets.js';
+import {
   Client,
   GatewayIntentBits,
   Partials,
@@ -21,6 +30,13 @@ const VERIFY_ENABLED = process.env.VERIFY_ENABLED === 'true';
 const KICK_SLUG = process.env.KICK_SLUG;
 const KICK_COUNTER_CHANNEL_ID = process.env.KICK_COUNTER_CHANNEL_ID;
 const KICK_REFRESH_MS = 10 * 60 * 1000;
+const TICKET_CONFIG = {
+  categoryId: process.env.TICKET_CATEGORY_ID,
+  archiveCategoryId: process.env.TICKET_ARCHIVE_CATEGORY_ID,
+  logChannelId: process.env.TICKET_LOG_CHANNEL_ID,
+  staffRoles: (process.env.TICKET_STAFF_ROLES || '').split(',').map((s) => s.trim()).filter(Boolean),
+};
+const TICKET_BANNER = 'server-banner.gif';
 const NO_REACTION_CHANNELS = (process.env.NO_REACTION_CHANNELS || '')
   .split(',')
   .map((id) => id.trim())
@@ -623,6 +639,135 @@ async function completeVerification(userId) {
   return { ok, message: failed.map((r) => `${r.label}: ${r.outcome.text}`).join(' | ') || 'ok' };
 }
 
+function isTicketStaff(member) {
+  return member.permissions.has('ManageChannels')
+    || TICKET_CONFIG.staffRoles.some((id) => member.roles.cache.has(id));
+}
+
+async function ticketLog(embed, files = []) {
+  if (!TICKET_CONFIG.logChannelId) return;
+  const channel = await client.channels.fetch(TICKET_CONFIG.logChannelId).catch(() => null);
+  if (!channel) return;
+  await channel.send({ embeds: [embed], files }).catch((err) => console.error('Log ticket fallito:', err.message));
+}
+
+async function archiveTicket(interaction) {
+  const channel = interaction.channel;
+  const ownerId = channel.topic?.match(/owner:(\d+)/)?.[1];
+
+  const transcript = await buildTranscript(channel);
+
+  if (TICKET_CONFIG.archiveCategoryId) {
+    await channel.setParent(TICKET_CONFIG.archiveCategoryId, { lockPermissions: false }).catch(() => null);
+  }
+  if (ownerId) {
+    await channel.permissionOverwrites.edit(ownerId, { SendMessages: false, ViewChannel: true }).catch(() => null);
+  }
+  await channel.setName(`closed-${channel.name.replace(/^ticket-/, '')}`.slice(0, 100)).catch(() => null);
+
+  const embed = new EmbedBuilder()
+    .setColor(0x6b7280)
+    .setTitle('🔒 Ticket chiuso')
+    .addFields(
+      { name: 'Canale', value: `${channel}`, inline: true },
+      { name: 'Chiuso da', value: `${interaction.user}`, inline: true },
+      { name: 'Proprietario', value: ownerId ? `<@${ownerId}>` : 'sconosciuto', inline: true },
+    )
+    .setTimestamp(new Date());
+
+  await ticketLog(embed, [transcript]);
+  await channel.send(archivedMessage(interaction.user));
+}
+
+async function handleTicketInteraction(interaction) {
+  if (interaction.isStringSelectMenu() && interaction.customId === 'ticket_select') {
+    const key = interaction.values[0];
+    if (!TICKET_TYPES[key]) return true;
+    await interaction.showModal(buildModal(key));
+    return true;
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket_modal:')) {
+    const key = interaction.customId.split(':')[1];
+    await interaction.deferReply({ ephemeral: true });
+    const answers = {
+      subject: interaction.fields.getTextInputValue('subject'),
+      details: interaction.fields.getTextInputValue('details'),
+      casino: TICKET_TYPES[key].askCasino ? interaction.fields.getTextInputValue('casino') : '',
+      account: interaction.fields.fields.has('account') ? interaction.fields.getTextInputValue('account') : '',
+    };
+    const result = await createTicket(interaction, TICKET_CONFIG, answers, key);
+    if (!result.ok) {
+      await interaction.editReply({ content: result.message });
+      return true;
+    }
+    await interaction.editReply({ content: `Your ticket has been created: ${result.channel}` });
+
+    const embed = new EmbedBuilder()
+      .setColor(result.type.colour)
+      .setTitle('🎫 Ticket aperto')
+      .addFields(
+        { name: 'Utente', value: `${interaction.user}`, inline: true },
+        { name: 'Tipo', value: `${result.type.emoji} ${result.type.label}`, inline: true },
+        { name: 'Canale', value: `${result.channel}`, inline: true },
+        { name: 'Oggetto', value: answers.subject },
+      )
+      .setTimestamp(new Date());
+    await ticketLog(embed);
+    return true;
+  }
+
+  if (interaction.isButton() && interaction.customId === 'ticket_claim') {
+    if (!isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'Only staff can claim a ticket.', ephemeral: true });
+      return true;
+    }
+    await interaction.reply({ content: `🙋 ${interaction.user} is handling this ticket.` });
+    return true;
+  }
+
+  if (interaction.isButton() && interaction.customId === 'ticket_close') {
+    await interaction.reply(closeConfirmMessage());
+    return true;
+  }
+
+  if (interaction.isButton() && interaction.customId === 'ticket_close_cancel') {
+    await interaction.update({ content: 'Cancelled.', embeds: [], components: [] });
+    return true;
+  }
+
+  if (interaction.isButton() && interaction.customId === 'ticket_close_confirm') {
+    await interaction.update({ content: 'Closing the ticket...', embeds: [], components: [] });
+    await archiveTicket(interaction);
+    return true;
+  }
+
+  if (interaction.isButton() && interaction.customId === 'ticket_delete') {
+    if (!isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'Only staff can delete a ticket.', ephemeral: true });
+      return true;
+    }
+    const name = interaction.channel.name;
+    await interaction.reply({ content: 'Deleting in 5 seconds...' });
+    setTimeout(() => {
+      interaction.channel.delete('Ticket eliminato dallo staff').catch(() => null);
+    }, 5000);
+
+    const embed = new EmbedBuilder()
+      .setColor(0xef4444)
+      .setTitle('🗑️ Ticket eliminato')
+      .addFields(
+        { name: 'Canale', value: name, inline: true },
+        { name: 'Eliminato da', value: `${interaction.user}`, inline: true },
+      )
+      .setTimestamp(new Date());
+    await ticketLog(embed);
+    return true;
+  }
+
+  return false;
+}
+
 const PAGE_SIZE = 20;
 
 async function membersPage(guild, page) {
@@ -675,6 +820,23 @@ async function membersPage(guild, page) {
 
 client.on('interactionCreate', async (interaction) => {
   try {
+    if (await handleTicketInteraction(interaction)) return;
+
+    if (interaction.isChatInputCommand() && interaction.commandName === 'ticket-panel') {
+      if (!interaction.memberPermissions.has('ManageGuild')) {
+        await interaction.reply({ content: 'You need the Manage Server permission.', ephemeral: true });
+        return;
+      }
+      await interaction.deferReply({ ephemeral: true });
+      const panel = buildPanel(TICKET_BANNER);
+      await interaction.channel.send({
+        ...panel,
+        files: [{ attachment: `./assets/${TICKET_BANNER}`, name: TICKET_BANNER }],
+      });
+      await interaction.editReply({ content: 'Panel published.' });
+      return;
+    }
+
     if (interaction.isChatInputCommand() && interaction.commandName === 'members') {
       await interaction.deferReply({ ephemeral: true });
       const payload = await membersPage(interaction.guild, 0);
