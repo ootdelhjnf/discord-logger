@@ -88,6 +88,16 @@ export function buildPanel(imageName) {
     .setFooter({ text: 'Cousik Community · Support' })
     .setTimestamp(new Date());
 
+  const button = new ButtonBuilder()
+    .setCustomId('ticket_open')
+    .setStyle(ButtonStyle.Primary)
+    .setLabel('Open a ticket')
+    .setEmoji('🎫');
+
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(button)] };
+}
+
+export function categoryChooser() {
   const menu = new StringSelectMenuBuilder()
     .setCustomId('ticket_select')
     .setPlaceholder('Select the reason for your ticket')
@@ -100,7 +110,16 @@ export function buildPanel(imageName) {
       })),
     );
 
-  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('What do you need help with?')
+    .setDescription('Choose the category that matches your request. You will then be asked for a few details so the staff can help you straight away.');
+
+  return {
+    embeds: [embed],
+    components: [new ActionRowBuilder().addComponents(menu)],
+    ephemeral: true,
+  };
 }
 
 export function buildModal(typeKey) {

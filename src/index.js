@@ -7,6 +7,7 @@ import {
   buildTranscript,
   closeConfirmMessage,
   archivedMessage,
+  categoryChooser,
   TICKET_TYPES,
 } from './tickets.js';
 import {
@@ -680,6 +681,11 @@ async function archiveTicket(interaction) {
 }
 
 async function handleTicketInteraction(interaction) {
+  if (interaction.isButton() && interaction.customId === 'ticket_open') {
+    await interaction.reply(categoryChooser());
+    return true;
+  }
+
   if (interaction.isStringSelectMenu() && interaction.customId === 'ticket_select') {
     const key = interaction.values[0];
     if (!TICKET_TYPES[key]) return true;
