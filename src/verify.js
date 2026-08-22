@@ -75,17 +75,17 @@ button:hover{filter:brightness(1.12)}
 function challengePage(entry, token, error) {
   const left = MAX_ATTEMPTS - entry.attempts;
   return shell(
-    'Verifica account',
+    'Account verification',
     `<div class="badge">Cousik Community</div>
-     <h1>Verifica che non sei un bot</h1>
-     <p>Ciao <strong>${escapeHtml(entry.username)}</strong>, digita il codice che vedi qui sotto per ottenere l'accesso al server.</p>
-     ${error ? `<div class="err">${escapeHtml(error)} — tentativi rimasti: ${left}</div>` : ''}
+     <h1>Verify you are not a bot</h1>
+     <p>Hi <strong>${escapeHtml(entry.username)}</strong>, type the code shown below to unlock access to the server.</p>
+     ${error ? `<div class="err">${escapeHtml(error)} — attempts left: ${left}</div>` : ''}
      <div class="captcha">${entry.svg}</div>
      <form method="POST" action="/verify/${token}">
-       <input name="code" maxlength="5" autocomplete="off" autocapitalize="characters" autofocus required placeholder="CODICE">
-       <button type="submit">Verifica</button>
+       <input name="code" maxlength="5" autocomplete="off" autocapitalize="characters" autofocus required placeholder="CODE">
+       <button type="submit">Verify</button>
      </form>
-     <div class="foot">Il link scade 15 minuti dopo l'ingresso nel server.</div>`,
+     <div class="foot">This link expires 15 minutes after you join the server.</div>`,
   );
 }
 
@@ -95,7 +95,7 @@ function resultPage(ok, title, message) {
     `<div class="ok">${ok ? '✅' : '⚠️'}</div>
      <h1>${escapeHtml(title)}</h1>
      <p>${escapeHtml(message)}</p>
-     ${ok ? '<div class="foot">Puoi chiudere questa pagina e tornare su Discord.</div>' : '<div class="foot">Torna su Discord e usa il comando /verifica per un nuovo link.</div>'}`,
+     ${ok ? '<div class="foot">You can close this page and go back to Discord.</div>' : '<div class="foot">Go back to Discord and use the /verify command to get a new link.</div>'}`,
     ok ? '#22c55e' : '#ef4444',
   );
 }
@@ -120,11 +120,11 @@ export async function handleVerify(req, res, pathname, onVerified) {
   const entry = pending.get(token);
 
   if (!entry || entry.expiresAt < Date.now()) {
-    html(res, 404, resultPage(false, 'Link non valido o scaduto', 'Questo link di verifica non esiste piu.'));
+    html(res, 404, resultPage(false, 'Invalid or expired link', 'This verification link no longer exists.'));
     return;
   }
   if (entry.done) {
-    html(res, 200, resultPage(true, 'Gia verificato', 'Il tuo account risulta gia verificato.'));
+    html(res, 200, resultPage(true, 'Already verified', 'Your account is already verified.'));
     return;
   }
 
@@ -133,7 +133,7 @@ export async function handleVerify(req, res, pathname, onVerified) {
     return;
   }
   if (req.method !== 'POST') {
-    html(res, 405, resultPage(false, 'Metodo non consentito', 'Usa il modulo della pagina.'));
+    html(res, 405, resultPage(false, 'Method not allowed', 'Please use the form on the page.'));
     return;
   }
 
@@ -144,13 +144,13 @@ export async function handleVerify(req, res, pathname, onVerified) {
   if (answer !== entry.code) {
     if (entry.attempts >= MAX_ATTEMPTS) {
       pending.delete(token);
-      html(res, 429, resultPage(false, 'Troppi tentativi', 'Hai sbagliato troppe volte.'));
+      html(res, 429, resultPage(false, 'Too many attempts', 'You entered the wrong code too many times.'));
       return;
     }
     const fresh = generateCaptcha();
     entry.code = fresh.text;
     entry.svg = fresh.svg;
-    html(res, 200, challengePage(entry, token, 'Codice errato'));
+    html(res, 200, challengePage(entry, token, 'Wrong code'));
     return;
   }
 
@@ -161,7 +161,7 @@ export async function handleVerify(req, res, pathname, onVerified) {
     res,
     outcome.ok ? 200 : 500,
     outcome.ok
-      ? resultPage(true, 'Verifica completata', 'Accesso sbloccato, benvenuto nel server!')
-      : resultPage(false, 'Verifica riuscita ma ruolo non assegnato', outcome.message),
+      ? resultPage(true, 'Verification complete', 'Access unlocked, welcome to the server!')
+      : resultPage(false, 'Verified, but roles were not granted', outcome.message),
   );
 }

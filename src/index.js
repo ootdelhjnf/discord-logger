@@ -16,6 +16,7 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
+const VERIFIED_ROLE_ID = process.env.VERIFIED_ROLE_ID;
 const VERIFY_ENABLED = process.env.VERIFY_ENABLED === 'true';
 const PUBLIC_URL = (process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || '').replace(/\/$/, '');
 
@@ -100,13 +101,13 @@ function socialField(user) {
   return items.join('\n');
 }
 
-async function assignAutoRole(member) {
-  if (!AUTO_ROLE_ID) return null;
-  if (member.roles.cache.has(AUTO_ROLE_ID)) return { ok: true, text: 'gia presente' };
+async function grantRole(member, roleId, reason) {
+  if (!roleId) return null;
+  if (member.roles.cache.has(roleId)) return { ok: true, text: 'gia presente' };
 
-  const role = member.guild.roles.cache.get(AUTO_ROLE_ID)
-    ?? (await member.guild.roles.fetch(AUTO_ROLE_ID).catch(() => null));
-  if (!role) return { ok: false, text: `ruolo ${AUTO_ROLE_ID} inesistente` };
+  const role = member.guild.roles.cache.get(roleId)
+    ?? (await member.guild.roles.fetch(roleId).catch(() => null));
+  if (!role) return { ok: false, text: `ruolo ${roleId} inesistente` };
 
   const me = await member.guild.members.fetchMe();
   if (!me.permissions.has('ManageRoles')) {
@@ -118,11 +119,15 @@ async function assignAutoRole(member) {
   if (role.managed) return { ok: false, text: `${role.name} e gestito da un'integrazione` };
 
   try {
-    await member.roles.add(role, 'Autorole ingresso');
-    return { ok: true, text: `${role} assegnato` };
+    await member.roles.add(role, reason);
+    return { ok: true, text: `${role} assegnato`, role };
   } catch (err) {
     return { ok: false, text: err.message };
   }
+}
+
+async function assignAutoRole(member) {
+  return grantRole(member, AUTO_ROLE_ID, 'Autorole ingresso');
 }
 
 async function findRemovalReason(guild, userId) {
@@ -404,17 +409,38 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 function verificationMessage(link) {
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
-    .setTitle('Verifica richiesta')
+    .setTitle('Verification required')
     .setDescription(
-      'Per accedere a **Cousik Community** devi completare una breve verifica anti-bot.\n\nApri il link, digita il codice che vedi e otterrai subito l’accesso.',
+      'Welcome to **Cousik Community**!\n\nBefore you can access the server you need to complete a quick anti-bot check.\n\nClick the button below, type the code you see on the page and your access will be unlocked instantly.',
     )
-    .addFields({ name: 'Validita', value: 'Il link scade tra 15 minuti' })
-    .setFooter({ text: 'Se il link scade usa /verifica nel server' });
+    .addFields(
+      { name: 'How long is it valid?', value: 'This link expires in 15 minutes', inline: true },
+      { name: 'Link expired?', value: 'Use `/verify` in the server', inline: true },
+    )
+    .setFooter({ text: 'Cousik Community - automated verification' })
+    .setTimestamp(new Date());
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Verificami').setEmoji('🛡️').setURL(link),
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Verify me').setEmoji('🛡️').setURL(link),
   );
   return { embeds: [embed], components: [row] };
+}
+
+function welcomeMessage(member, roleNames) {
+  const embed = new EmbedBuilder()
+    .setColor(0x22c55e)
+    .setTitle('Verification complete')
+    .setDescription(
+      `You are now verified in **${member.guild.name}**.\n\nEnjoy your stay and please follow the server rules.`,
+    )
+    .setThumbnail(member.guild.iconURL({ size: 256 }) ?? member.displayAvatarURL(VIEW))
+    .addFields(
+      { name: 'Roles granted', value: roleNames.length ? roleNames.join('\n') : 'none', inline: true },
+      { name: 'Verified at', value: time(new Date(), 'f'), inline: true },
+    )
+    .setFooter({ text: 'Cousik Community' })
+    .setTimestamp(new Date());
+  return { embeds: [embed] };
 }
 
 async function startVerification(member) {
@@ -434,22 +460,46 @@ async function completeVerification(userId) {
   if (!guild) return { ok: false, message: 'server non raggiungibile' };
 
   const member = await guild.members.fetch(userId).catch(() => null);
-  if (!member) return { ok: false, message: 'non risulti piu nel server' };
+  if (!member) return { ok: false, message: 'you are no longer in the server' };
 
-  const auto = await assignAutoRole(member);
-  const ok = Boolean(auto?.ok);
+  const results = [
+    { label: 'Member', outcome: await grantRole(member, AUTO_ROLE_ID, 'Verifica captcha superata') },
+    { label: 'Verified', outcome: await grantRole(member, VERIFIED_ROLE_ID, 'Verifica captcha superata') },
+  ].filter((r) => r.outcome);
+
+  const failed = results.filter((r) => !r.outcome.ok);
+  const ok = failed.length === 0 && results.length > 0;
+  const granted = results.filter((r) => r.outcome.ok).map((r) => `<@&${r.label === 'Member' ? AUTO_ROLE_ID : VERIFIED_ROLE_ID}>`);
+
+  let dmStatus = 'non inviata';
+  try {
+    await member.send(welcomeMessage(member, granted));
+    dmStatus = 'inviata in MP';
+  } catch {
+    dmStatus = 'MP chiusi';
+  }
 
   const embed = new EmbedBuilder()
     .setColor(ok ? 0x22c55e : 0xe67e22)
-    .setTitle(ok ? 'Captcha superato' : 'Captcha superato ma ruolo non assegnato')
+    .setTitle(ok ? 'Captcha superato' : 'Captcha superato ma con errori')
     .setDescription(`${member} — **${member.user.tag}**`)
     .setThumbnail(member.displayAvatarURL(VIEW))
-    .addFields({ name: 'Esito', value: auto?.text ?? 'nessun ruolo configurato' })
+    .addFields(
+      { name: 'Ruoli assegnati', value: granted.length ? granted.join(' ') : 'nessuno', inline: true },
+      { name: 'Conferma utente', value: dmStatus, inline: true },
+    )
     .setFooter({ text: `ID: ${member.id}` })
     .setTimestamp(new Date());
+
+  if (failed.length) {
+    embed.addFields({
+      name: 'Errori',
+      value: failed.map((r) => `${r.label}: ${r.outcome.text}`).join('\n'),
+    });
+  }
   await send(embed);
 
-  return { ok, message: auto?.text ?? 'nessun ruolo configurato' };
+  return { ok, message: failed.map((r) => `${r.label}: ${r.outcome.text}`).join(' | ') || 'ok' };
 }
 
 const PAGE_SIZE = 20;
@@ -468,33 +518,33 @@ async function membersPage(guild, page) {
   const lines = slice.map((m, i) => {
     const n = current * PAGE_SIZE + i + 1;
     const name = m.nickname ?? m.user.globalName ?? m.user.username;
-    const joined = m.joinedAt ? time(m.joinedAt, 'd') : 'data ignota';
+    const joined = m.joinedAt ? time(m.joinedAt, 'd') : 'unknown date';
     return `\`${String(n).padStart(4)}\` ${m.user.bot ? '🤖' : '👤'} **${name}** \`@${m.user.username}\` · ${joined}`;
   });
 
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
-    .setTitle('Tutti i membri del server')
-    .setDescription(lines.join('\n') || 'nessun membro')
+    .setTitle('All server members')
+    .setDescription(lines.join('\n') || 'no members')
     .addFields(
-      { name: 'Totale', value: `${sorted.length}`, inline: true },
-      { name: 'Persone', value: `${humans.length}`, inline: true },
-      { name: 'Bot', value: `${bots.length}`, inline: true },
+      { name: 'Total', value: `${sorted.length}`, inline: true },
+      { name: 'People', value: `${humans.length}`, inline: true },
+      { name: 'Bots', value: `${bots.length}`, inline: true },
     )
-    .setFooter({ text: `Pagina ${current + 1} di ${pages} · online e offline inclusi` })
+    .setFooter({ text: `Page ${current + 1} of ${pages} · online and offline included` })
     .setTimestamp(new Date());
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`membri:${current - 1}`)
       .setStyle(ButtonStyle.Secondary)
-      .setLabel('Indietro')
+      .setLabel('Previous')
       .setEmoji('⬅️')
       .setDisabled(current === 0),
     new ButtonBuilder()
       .setCustomId(`membri:${current + 1}`)
       .setStyle(ButtonStyle.Secondary)
-      .setLabel('Avanti')
+      .setLabel('Next')
       .setEmoji('➡️')
       .setDisabled(current >= pages - 1),
   );
@@ -504,19 +554,19 @@ async function membersPage(guild, page) {
 
 client.on('interactionCreate', async (interaction) => {
   try {
-    if (interaction.isChatInputCommand() && interaction.commandName === 'membri') {
+    if (interaction.isChatInputCommand() && interaction.commandName === 'members') {
       await interaction.deferReply({ ephemeral: true });
       const payload = await membersPage(interaction.guild, 0);
       await interaction.editReply(payload);
       return;
     }
-    if (interaction.isChatInputCommand() && interaction.commandName === 'verifica') {
+    if (interaction.isChatInputCommand() && interaction.commandName === 'verify') {
       if (!PUBLIC_URL) {
-        await interaction.reply({ content: 'Verifica non configurata.', ephemeral: true });
+        await interaction.reply({ content: 'Verification is not configured.', ephemeral: true });
         return;
       }
-      if (AUTO_ROLE_ID && interaction.member.roles.cache.has(AUTO_ROLE_ID)) {
-        await interaction.reply({ content: 'Risulti gia verificato.', ephemeral: true });
+      if (VERIFIED_ROLE_ID && interaction.member.roles.cache.has(VERIFIED_ROLE_ID)) {
+        await interaction.reply({ content: 'You are already verified.', ephemeral: true });
         return;
       }
       const token = createVerification(interaction.user.id, interaction.user.username);
