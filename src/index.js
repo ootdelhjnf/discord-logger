@@ -18,6 +18,9 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
 const VERIFIED_ROLE_ID = process.env.VERIFIED_ROLE_ID;
 const VERIFY_ENABLED = process.env.VERIFY_ENABLED === 'true';
+const KICK_SLUG = process.env.KICK_SLUG;
+const KICK_COUNTER_CHANNEL_ID = process.env.KICK_COUNTER_CHANNEL_ID;
+const KICK_REFRESH_MS = 10 * 60 * 1000;
 const NO_REACTION_CHANNELS = (process.env.NO_REACTION_CHANNELS || '')
   .split(',')
   .map((id) => id.trim())
@@ -196,6 +199,12 @@ client.once('clientReady', async () => {
     return;
   }
   console.log(`Intent membri OK — ${members.size} membri in cache. Logger attivo.`);
+
+  if (KICK_SLUG && KICK_COUNTER_CHANNEL_ID) {
+    await updateKickCounter();
+    setInterval(updateKickCounter, KICK_REFRESH_MS);
+    console.log(`Contatore Kick attivo su ${KICK_SLUG}, aggiornamento ogni ${KICK_REFRESH_MS / 60000} minuti`);
+  }
 });
 
 client.on('guildMemberAdd', async (member) => {
@@ -411,6 +420,58 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
   await send(embed, buttons);
 });
+
+let kickState = { followers: null, live: false, name: null, updatedAt: null };
+
+async function fetchKickChannel() {
+  const res = await fetch(`https://kick.com/api/v2/channels/${KICK_SLUG}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+      Accept: 'application/json',
+    },
+  });
+  if (!res.ok) throw new Error(`Kick ha risposto ${res.status}`);
+  return res.json();
+}
+
+async function updateKickCounter() {
+  if (!KICK_SLUG || !KICK_COUNTER_CHANNEL_ID) return;
+
+  let data;
+  try {
+    data = await fetchKickChannel();
+  } catch (err) {
+    console.error('Kick non raggiungibile:', err.message);
+    return;
+  }
+
+  const followers = data?.followers_count;
+  if (typeof followers !== 'number') return;
+
+  const live = Boolean(data.livestream);
+  const name = `${live ? '🔴' : '🟢'}・𝗞𝗜𝗖𝗞: ${followers.toLocaleString('en-US')}`;
+
+  kickState = { followers, live, name, updatedAt: new Date().toISOString() };
+  if (name === kickState.applied) return;
+
+  const channel = await client.channels.fetch(KICK_COUNTER_CHANNEL_ID).catch(() => null);
+  if (!channel) {
+    console.error('Canale contatore Kick non trovato');
+    return;
+  }
+  if (channel.name === name) {
+    kickState.applied = name;
+    return;
+  }
+
+  try {
+    await channel.setName(name, 'Aggiornamento contatore follower Kick');
+    kickState.applied = name;
+    console.log(`contatore Kick aggiornato: ${name}`);
+  } catch (err) {
+    console.error('Rinomina contatore fallita:', err.message);
+  }
+}
 
 function verificationMessage(link) {
   const embed = new EmbedBuilder()
@@ -641,6 +702,9 @@ createServer(async (req, res) => {
       lastPingAt: lastPingAt.toISOString(),
       verifyEnabled: VERIFY_ENABLED,
       verifyPending: pendingCount(),
+      kick: KICK_SLUG
+        ? { slug: KICK_SLUG, followers: kickState.followers, live: kickState.live, updatedAt: kickState.updatedAt }
+        : null,
     }),
   );
 }).listen(PORT, () => console.log(`Keep-alive HTTP in ascolto sulla porta ${PORT}`));
