@@ -125,6 +125,7 @@ const TICKET_STAFF_AVATAR = process.env.TICKET_STAFF_AVATAR;
 const TICKET_STAFF_PREFIX = process.env.TICKET_STAFF_PREFIX || 'Support';
 const TICKET_RELAY_NAME = process.env.TICKET_RELAY_NAME || '🛡️ staff-relay';
 const relayParents = new Map();
+const relayThreads = new Map();
 const ticketWebhooks = new Map();
 const anonCache = new Map();
 const NO_REACTION_CHANNELS = (process.env.NO_REACTION_CHANNELS || '')
@@ -1353,6 +1354,7 @@ async function ensureRelayThread(channel, member) {
       content: [
         '**Staff relay**',
         'Everything you write **here** is republished in the ticket under your support identity.',
+        'Every message the user sends in the ticket lands **here** too, so you never have to switch channel.',
         'The user never sees this thread, never sees you typing and never sees the original message.',
         'Start a line with `//` to keep it as an internal note instead.',
       ].join('\n'),
@@ -1363,7 +1365,44 @@ async function ensureRelayThread(channel, member) {
   await thread.members.add(member.id).catch(() => null);
   await setRelayThread(thread.id, channel.id);
   relayParents.set(thread.id, channel.id);
+  relayThreads.set(channel.id, thread.id);
   return thread;
+}
+
+async function relayThreadFor(channelId) {
+  if (relayThreads.has(channelId)) return relayThreads.get(channelId);
+  const threadId = await getRelayThread(channelId);
+  relayThreads.set(channelId, threadId);
+  return threadId;
+}
+
+async function forwardToRelay(channel, { name, avatarURL, content, files }) {
+  const threadId = await relayThreadFor(channel.id);
+  if (!threadId) return null;
+
+  const thread = await channel.threads.fetch(threadId).catch(() => null);
+  if (!thread) {
+    relayThreads.set(channel.id, null);
+    return null;
+  }
+  if (thread.archived) await thread.setArchived(false).catch(() => null);
+
+  const hook = await getTicketWebhook(channel);
+  if (!hook) return thread.send({ content: `**${name}:** ${content ?? ''}`.slice(0, 1900), files }).catch(() => null);
+
+  return hook
+    .send({
+      threadId,
+      username: name.slice(0, 80),
+      avatarURL,
+      content: content || undefined,
+      files,
+      allowedMentions: { parse: [] },
+    })
+    .catch((err) => {
+      console.error('Inoltro nel relay fallito:', err.message);
+      return null;
+    });
 }
 
 async function relayParentFor(threadId) {
@@ -1419,6 +1458,7 @@ async function archiveTicket(interaction, resolved) {
     await thread?.setArchived(true, 'Ticket chiuso').catch(() => null);
     relayParents.delete(relayId);
   }
+  relayThreads.delete(channel.id);
   await clearRelays(channel.id);
 
   await markClosed(channel.id, {
@@ -1942,14 +1982,24 @@ client.on('messageCreate', async (message) => {
 
   if (!isTicketChannel(message.channel)) return;
 
-  const anonStaff = await anonMapFor(message.channel.id);
-  if (!anonStaff.has(message.author.id)) return;
-  if (!message.member || !isTicketStaff(message.member)) return;
-  const shownName = staffDisplayName(anonStaff.get(message.author.id));
-
   const content = message.content?.trim();
   const files = [...message.attachments.values()].map((a) => a.url);
   if (!content && !files.length) return;
+
+  const anonStaff = await anonMapFor(message.channel.id);
+  const isAnonStaff = anonStaff.has(message.author.id) && message.member && isTicketStaff(message.member);
+
+  if (!isAnonStaff) {
+    await forwardToRelay(message.channel, {
+      name: message.member?.displayName ?? message.author.username,
+      avatarURL: message.author.displayAvatarURL({ extension: 'png', size: 128 }),
+      content,
+      files,
+    });
+    return;
+  }
+
+  const shownName = staffDisplayName(anonStaff.get(message.author.id));
 
   await message.delete().catch((err) => console.error('Mirror anonimo: delete fallito:', err.message));
   const sent = await sendAsStaff(
@@ -1962,6 +2012,13 @@ client.on('messageCreate', async (message) => {
     shownName,
   );
   if (!sent) return;
+
+  await forwardToRelay(message.channel, {
+    name: shownName,
+    avatarURL: staffAvatar(message.guild),
+    content,
+    files,
+  });
 
   const embed = new EmbedBuilder()
     .setColor(0x8b5cf6)
