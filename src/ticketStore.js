@@ -36,28 +36,34 @@ async function persist() {
   return writing;
 }
 
-export async function getAnonStaff(channelId) {
-  const state = await load();
-  return state.anonModes[channelId] ?? [];
+function normalizeAnonEntry(raw) {
+  if (Array.isArray(raw)) return Object.fromEntries(raw.map((id) => [id, null]));
+  return raw && typeof raw === 'object' ? raw : {};
 }
 
-export async function toggleAnonStaff(channelId, userId) {
+export async function getAnonStaff(channelId) {
   const state = await load();
-  const current = new Set(state.anonModes[channelId] ?? []);
-  const enabled = !current.has(userId);
-  if (enabled) current.add(userId);
-  else current.delete(userId);
+  return normalizeAnonEntry(state.anonModes[channelId]);
+}
 
-  if (current.size) state.anonModes[channelId] = [...current];
+export async function setAnonStaff(channelId, userId, enabled, alias = null) {
+  const state = await load();
+  const current = normalizeAnonEntry(state.anonModes[channelId]);
+
+  if (enabled) current[userId] = alias;
+  else delete current[userId];
+
+  if (Object.keys(current).length) state.anonModes[channelId] = current;
   else delete state.anonModes[channelId];
   await persist();
   return enabled;
 }
 
-export async function setAnonStaff(channelId, userId, enabled) {
-  const current = new Set(await getAnonStaff(channelId));
-  if (current.has(userId) === enabled) return enabled;
-  return toggleAnonStaff(channelId, userId);
+export async function toggleAnonStaff(channelId, userId, alias = null) {
+  const current = await getAnonStaff(channelId);
+  const enabled = !(userId in current);
+  await setAnonStaff(channelId, userId, enabled, alias);
+  return enabled;
 }
 
 export async function clearAnonStaff(channelId) {

@@ -482,6 +482,49 @@ export function claimAnnouncement(alias, user, anonymous) {
   return { embeds: [embed] };
 }
 
+export function aliasChooser(flow, prefix, defaultAlias, memberName) {
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('🛡️ Which name should the user see?')
+    .setDescription(
+      [
+        `Every option keeps **${prefix}** in front, so the user always knows he is talking to the staff.`,
+        '',
+        `**${defaultAlias}** — fully anonymous, no personal name`,
+        `**${prefix} / ${memberName}** — the user sees a name he can call you by`,
+        `**${prefix} / custom** — pick any nickname you want`,
+      ].join('\n'),
+    );
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`ticket_alias_select:${flow}`)
+    .setPlaceholder('Choose the identity to reply with')
+    .addOptions(
+      { value: 'none', label: defaultAlias.slice(0, 90), description: 'No personal name at all', emoji: '🛡️' },
+      { value: 'self', label: `${prefix} / ${memberName}`.slice(0, 90), description: 'Your server display name', emoji: '🙋' },
+      { value: 'custom', label: `${prefix} / custom alias`.slice(0, 90), description: 'Type the nickname you prefer', emoji: '✏️' },
+    );
+
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true };
+}
+
+export function aliasModal(flow, prefix) {
+  const modal = new ModalBuilder()
+    .setCustomId(`ticket_alias_modal:${flow}`)
+    .setTitle(`${prefix} / ...`.slice(0, 45));
+
+  const alias = new TextInputBuilder()
+    .setCustomId('alias')
+    .setLabel('Nickname shown after the prefix')
+    .setPlaceholder('Mark')
+    .setStyle(TextInputStyle.Short)
+    .setMinLength(2)
+    .setMaxLength(24)
+    .setRequired(true);
+
+  return modal.addComponents(new ActionRowBuilder().addComponents(alias));
+}
+
 export function staffReplyModal(alias) {
   const modal = new ModalBuilder()
     .setCustomId('ticket_staff_reply_modal')

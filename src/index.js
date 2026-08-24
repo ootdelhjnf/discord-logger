@@ -14,6 +14,8 @@ import {
   ticketDetailMessage,
   claimChooser,
   claimAnnouncement,
+  aliasChooser,
+  aliasModal,
   staffReplyModal,
   staffReplyLog,
   TICKET_TYPES,
@@ -116,6 +118,7 @@ const TICKET_CONFIG = {
 const TICKET_BANNER = 'server-banner.gif';
 const TICKET_STAFF_ALIAS = process.env.TICKET_STAFF_ALIAS || 'Support Team';
 const TICKET_STAFF_AVATAR = process.env.TICKET_STAFF_AVATAR;
+const TICKET_STAFF_PREFIX = process.env.TICKET_STAFF_PREFIX || 'Support';
 const ticketWebhooks = new Map();
 const anonCache = new Map();
 const NO_REACTION_CHANNELS = (process.env.NO_REACTION_CHANNELS || '')
@@ -1294,36 +1297,40 @@ async function getTicketWebhook(channel) {
   return hook;
 }
 
-async function anonSetFor(channelId) {
+function staffDisplayName(alias) {
+  return alias ? `${TICKET_STAFF_PREFIX} / ${alias}` : TICKET_STAFF_ALIAS;
+}
+
+async function anonMapFor(channelId) {
   if (anonCache.has(channelId)) return anonCache.get(channelId);
-  const set = new Set(await getAnonStaff(channelId));
-  anonCache.set(channelId, set);
-  return set;
+  const map = new Map(Object.entries(await getAnonStaff(channelId)));
+  anonCache.set(channelId, map);
+  return map;
 }
 
-async function setAnonymousMode(channelId, userId, enabled) {
-  await setAnonStaff(channelId, userId, enabled);
-  const set = await anonSetFor(channelId);
-  if (enabled) set.add(userId);
-  else set.delete(userId);
+async function setAnonymousMode(channelId, userId, enabled, alias = null) {
+  await setAnonStaff(channelId, userId, enabled, alias);
+  const map = await anonMapFor(channelId);
+  if (enabled) map.set(userId, alias);
+  else map.delete(userId);
   return enabled;
 }
 
-async function switchAnonymousMode(channelId, userId) {
-  const enabled = await toggleAnonStaff(channelId, userId);
-  const set = await anonSetFor(channelId);
-  if (enabled) set.add(userId);
-  else set.delete(userId);
+async function switchAnonymousMode(channelId, userId, alias = null) {
+  const enabled = await toggleAnonStaff(channelId, userId, alias);
+  const map = await anonMapFor(channelId);
+  if (enabled) map.set(userId, alias);
+  else map.delete(userId);
   return enabled;
 }
 
-async function sendAsStaff(channel, payload) {
+async function sendAsStaff(channel, payload, displayName = TICKET_STAFF_ALIAS) {
   const hook = await getTicketWebhook(channel);
   if (!hook) return channel.send(payload).catch(() => null);
   return hook
     .send({
       ...payload,
-      username: TICKET_STAFF_ALIAS.slice(0, 80),
+      username: displayName.slice(0, 80),
       avatarURL: staffAvatar(channel.guild),
       withComponents: true,
     })
@@ -1379,6 +1386,43 @@ async function archiveTicket(interaction, resolved) {
 
   await ticketLog(embed, [transcript]);
   await channel.send(archivedMessage(interaction.user, resolved, ownerId));
+}
+
+function claimLogEmbed(interaction, mode) {
+  return new EmbedBuilder()
+    .setColor(0x22c55e)
+    .setTitle('🙋 Ticket preso in carico')
+    .addFields(
+      { name: 'Staff', value: `${interaction.user}`, inline: true },
+      { name: 'Modalita', value: mode, inline: true },
+      { name: 'Canale', value: `${interaction.channel}`, inline: true },
+    )
+    .setTimestamp(new Date());
+}
+
+async function applyAnonymousIdentity(interaction, flow, alias) {
+  const shown = staffDisplayName(alias);
+  await setAnonymousMode(interaction.channel.id, interaction.user.id, true, alias);
+
+  if (flow === 'claim') {
+    await sendAsStaff(interaction.channel, claimAnnouncement(shown, interaction.user, true), shown);
+    await updateTicket(interaction.channel.id, {
+      claimedBy: interaction.user.id,
+      claimedByTag: interaction.user.tag,
+      claimAnonymous: true,
+      claimAlias: shown,
+    });
+    await ticketLog(claimLogEmbed(interaction, `anonima come ${shown}`));
+  }
+
+  const message = [
+    `🛡️ You now reply as **${shown}**.`,
+    'Every message you type in this ticket is automatically republished under that name, no button needed.',
+    'Press 🛡️ Anonymous mode again to go back to your real name.',
+  ].join('\n');
+
+  if (interaction.isModalSubmit()) await interaction.reply({ content: message, ephemeral: true });
+  else await interaction.update({ content: message, embeds: [], components: [] });
 }
 
 async function handleTicketInteraction(interaction) {
@@ -1472,36 +1516,57 @@ async function handleTicketInteraction(interaction) {
       return true;
     }
     const anonymous = interaction.customId.split(':')[1] === 'anon';
-    const payload = claimAnnouncement(TICKET_STAFF_ALIAS, interaction.user, anonymous);
 
-    if (anonymous) await sendAsStaff(interaction.channel, payload);
-    else await interaction.channel.send(payload);
+    if (anonymous) {
+      await interaction.update(
+        aliasChooser('claim', TICKET_STAFF_PREFIX, TICKET_STAFF_ALIAS, interaction.member.displayName),
+      );
+      return true;
+    }
 
+    await interaction.channel.send(claimAnnouncement(TICKET_STAFF_ALIAS, interaction.user, false));
     await interaction.update({
-      content: anonymous
-        ? `Claimed as **${TICKET_STAFF_ALIAS}**. From now on **every message you type here** is republished under that identity, no button needed. Use 🛡️ Anonymous mode to turn it off.`
-        : 'Claimed with your name. Just type in the channel as usual.',
+      content: 'Claimed with your name. Just type in the channel as usual.',
       embeds: [],
       components: [],
     });
 
-    await setAnonymousMode(interaction.channel.id, interaction.user.id, anonymous);
+    await setAnonymousMode(interaction.channel.id, interaction.user.id, false);
     await updateTicket(interaction.channel.id, {
       claimedBy: interaction.user.id,
       claimedByTag: interaction.user.tag,
-      claimAnonymous: anonymous,
+      claimAnonymous: false,
     });
+    await ticketLog(claimLogEmbed(interaction, 'nome reale'));
+    return true;
+  }
 
-    const embed = new EmbedBuilder()
-      .setColor(0x22c55e)
-      .setTitle('🙋 Ticket preso in carico')
-      .addFields(
-        { name: 'Staff', value: `${interaction.user}`, inline: true },
-        { name: 'Modalita', value: anonymous ? `anonima (${TICKET_STAFF_ALIAS})` : 'nome reale', inline: true },
-        { name: 'Canale', value: `${interaction.channel}`, inline: true },
-      )
-      .setTimestamp(new Date());
-    await ticketLog(embed);
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith('ticket_alias_select:')) {
+    if (!isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'Only staff can use this.', ephemeral: true });
+      return true;
+    }
+    const flow = interaction.customId.split(':')[1];
+    const choice = interaction.values[0];
+
+    if (choice === 'custom') {
+      await interaction.showModal(aliasModal(flow, TICKET_STAFF_PREFIX));
+      return true;
+    }
+
+    const alias = choice === 'self' ? interaction.member.displayName : null;
+    await applyAnonymousIdentity(interaction, flow, alias);
+    return true;
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket_alias_modal:')) {
+    if (!isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'Only staff can use this.', ephemeral: true });
+      return true;
+    }
+    const flow = interaction.customId.split(':')[1];
+    const alias = interaction.fields.getTextInputValue('alias').trim();
+    await applyAnonymousIdentity(interaction, flow, alias);
     return true;
   }
 
@@ -1510,13 +1575,18 @@ async function handleTicketInteraction(interaction) {
       await interaction.reply({ content: 'Only staff can use this.', ephemeral: true });
       return true;
     }
-    const enabled = await switchAnonymousMode(interaction.channel.id, interaction.user.id);
-    await interaction.reply({
-      content: enabled
-        ? `🛡️ Anonymous mode **ON**. Everything you write in this ticket is republished as **${TICKET_STAFF_ALIAS}**.`
-        : '🙋 Anonymous mode **OFF**. Your messages now show your real Discord name.',
-      ephemeral: true,
-    });
+    const active = (await anonMapFor(interaction.channel.id)).has(interaction.user.id);
+    if (active) {
+      await setAnonymousMode(interaction.channel.id, interaction.user.id, false);
+      await interaction.reply({
+        content: '🙋 Anonymous mode **OFF**. Your messages now show your real Discord name.',
+        ephemeral: true,
+      });
+      return true;
+    }
+    await interaction.reply(
+      aliasChooser('toggle', TICKET_STAFF_PREFIX, TICKET_STAFF_ALIAS, interaction.member.displayName),
+    );
     return true;
   }
 
@@ -1536,11 +1606,13 @@ async function handleTicketInteraction(interaction) {
     }
     const text = interaction.fields.getTextInputValue('message');
     await interaction.deferReply({ ephemeral: true });
-    const sent = await sendAsStaff(interaction.channel, { content: text, allowedMentions: { parse: [] } });
+    const alias = (await anonMapFor(interaction.channel.id)).get(interaction.user.id) ?? null;
+    const shown = staffDisplayName(alias);
+    const sent = await sendAsStaff(interaction.channel, { content: text, allowedMentions: { parse: [] } }, shown);
     await interaction.editReply({
-      content: sent ? `Sent as **${TICKET_STAFF_ALIAS}**.` : 'Could not send the message.',
+      content: sent ? `Sent as **${shown}**.` : 'Could not send the message.',
     });
-    await ticketLog(staffReplyLog(TICKET_STAFF_ALIAS, interaction.user, interaction.channel, text));
+    await ticketLog(staffReplyLog(shown, interaction.user, interaction.channel, text));
     return true;
   }
 
@@ -1778,20 +1850,25 @@ client.on('messageCreate', async (message) => {
   if (!message.guild || message.author.bot || message.webhookId || message.system) return;
   if (!isTicketChannel(message.channel)) return;
 
-  const anonStaff = await anonSetFor(message.channel.id);
+  const anonStaff = await anonMapFor(message.channel.id);
   if (!anonStaff.has(message.author.id)) return;
   if (!message.member || !isTicketStaff(message.member)) return;
+  const shownName = staffDisplayName(anonStaff.get(message.author.id));
 
   const content = message.content?.trim();
   const files = [...message.attachments.values()].map((a) => a.url);
   if (!content && !files.length) return;
 
   await message.delete().catch((err) => console.error('Mirror anonimo: delete fallito:', err.message));
-  const sent = await sendAsStaff(message.channel, {
-    content: content || undefined,
-    files,
-    allowedMentions: { parse: [], users: [...message.mentions.users.keys()].slice(0, 10) },
-  });
+  const sent = await sendAsStaff(
+    message.channel,
+    {
+      content: content || undefined,
+      files,
+      allowedMentions: { parse: [], users: [...message.mentions.users.keys()].slice(0, 10) },
+    },
+    shownName,
+  );
   if (!sent) return;
 
   const embed = new EmbedBuilder()
@@ -1799,6 +1876,7 @@ client.on('messageCreate', async (message) => {
     .setTitle('🛡️ Messaggio staff anonimizzato')
     .addFields(
       { name: 'Autore reale', value: `${message.author} (${message.author.tag})`, inline: true },
+      { name: 'Mostrato come', value: shownName, inline: true },
       { name: 'Canale', value: `${message.channel}`, inline: true },
       { name: 'Testo', value: (content || '(solo allegati)').slice(0, 1024) },
     )
