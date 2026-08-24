@@ -14,9 +14,10 @@ async function load() {
     cache = {
       tickets: Array.isArray(parsed?.tickets) ? parsed.tickets : [],
       anonModes: parsed?.anonModes && typeof parsed.anonModes === 'object' ? parsed.anonModes : {},
+      relays: parsed?.relays && typeof parsed.relays === 'object' ? parsed.relays : {},
     };
   } catch {
-    cache = { tickets: [], anonModes: {} };
+    cache = { tickets: [], anonModes: {}, relays: {} };
   }
   return cache;
 }
@@ -26,7 +27,7 @@ async function loadTickets() {
 }
 
 async function persist() {
-  const snapshot = cache ?? { tickets: [], anonModes: {} };
+  const snapshot = cache ?? { tickets: [], anonModes: {}, relays: {} };
   writing = writing.then(async () => {
     await mkdir(dirname(FILE), { recursive: true });
     const tmp = `${FILE}.tmp`;
@@ -64,6 +65,32 @@ export async function toggleAnonStaff(channelId, userId, alias = null) {
   const enabled = !(userId in current);
   await setAnonStaff(channelId, userId, enabled, alias);
   return enabled;
+}
+
+export async function setRelayThread(threadId, channelId) {
+  const state = await load();
+  if (state.relays[threadId] === channelId) return;
+  state.relays[threadId] = channelId;
+  await persist();
+}
+
+export async function getRelayParent(threadId) {
+  const state = await load();
+  return state.relays[threadId] ?? null;
+}
+
+export async function getRelayThread(channelId) {
+  const state = await load();
+  return Object.entries(state.relays).find(([, parent]) => parent === channelId)?.[0] ?? null;
+}
+
+export async function clearRelays(channelId) {
+  const state = await load();
+  const before = Object.keys(state.relays).length;
+  for (const [threadId, parent] of Object.entries(state.relays)) {
+    if (parent === channelId) delete state.relays[threadId];
+  }
+  if (Object.keys(state.relays).length !== before) await persist();
 }
 
 export async function clearAnonStaff(channelId) {

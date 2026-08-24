@@ -29,6 +29,10 @@ import {
   toggleAnonStaff,
   setAnonStaff,
   clearAnonStaff,
+  setRelayThread,
+  getRelayParent,
+  getRelayThread,
+  clearRelays,
 } from './ticketStore.js';
 import { startCodeStream, buildCodeMessage, expiredCodeMessage, redeemInstructions, buildStatsMessage, statsChannelName } from './codes.js';
 import {
@@ -119,6 +123,8 @@ const TICKET_BANNER = 'server-banner.gif';
 const TICKET_STAFF_ALIAS = process.env.TICKET_STAFF_ALIAS || 'Support Team';
 const TICKET_STAFF_AVATAR = process.env.TICKET_STAFF_AVATAR;
 const TICKET_STAFF_PREFIX = process.env.TICKET_STAFF_PREFIX || 'Support';
+const TICKET_RELAY_NAME = process.env.TICKET_RELAY_NAME || '🛡️ staff-relay';
+const relayParents = new Map();
 const ticketWebhooks = new Map();
 const anonCache = new Map();
 const NO_REACTION_CHANNELS = (process.env.NO_REACTION_CHANNELS || '')
@@ -1324,6 +1330,49 @@ async function switchAnonymousMode(channelId, userId, alias = null) {
   return enabled;
 }
 
+async function ensureRelayThread(channel, member) {
+  const knownId = await getRelayThread(channel.id);
+  let thread = knownId ? await channel.threads.fetch(knownId).catch(() => null) : null;
+
+  if (!thread) {
+    thread = await channel.threads
+      .create({
+        name: TICKET_RELAY_NAME,
+        type: ChannelType.PrivateThread,
+        invitable: false,
+        autoArchiveDuration: 10080,
+        reason: 'Canale privato staff per rispondere senza mostrare identita',
+      })
+      .catch((err) => {
+        console.error('Creazione relay thread fallita:', err.message);
+        return null;
+      });
+    if (!thread) return null;
+
+    await thread.send({
+      content: [
+        '**Staff relay**',
+        'Everything you write **here** is republished in the ticket under your support identity.',
+        'The user never sees this thread, never sees you typing and never sees the original message.',
+        'Start a line with `//` to keep it as an internal note instead.',
+      ].join('\n'),
+    }).catch(() => null);
+  }
+
+  if (thread.archived) await thread.setArchived(false).catch(() => null);
+  await thread.members.add(member.id).catch(() => null);
+  await setRelayThread(thread.id, channel.id);
+  relayParents.set(thread.id, channel.id);
+  return thread;
+}
+
+async function relayParentFor(threadId) {
+  if (relayParents.has(threadId)) return relayParents.get(threadId);
+  const parent = await getRelayParent(threadId);
+  if (parent) relayParents.set(threadId, parent);
+  return parent;
+}
+
 async function sendAsStaff(channel, payload, displayName = TICKET_STAFF_ALIAS) {
   const hook = await getTicketWebhook(channel);
   if (!hook) return channel.send(payload).catch(() => null);
@@ -1363,6 +1412,14 @@ async function archiveTicket(interaction, resolved) {
 
   anonCache.delete(channel.id);
   await clearAnonStaff(channel.id);
+
+  const relayId = await getRelayThread(channel.id);
+  if (relayId) {
+    const thread = await channel.threads.fetch(relayId).catch(() => null);
+    await thread?.setArchived(true, 'Ticket chiuso').catch(() => null);
+    relayParents.delete(relayId);
+  }
+  await clearRelays(channel.id);
 
   await markClosed(channel.id, {
     resolved,
@@ -1415,9 +1472,14 @@ async function applyAnonymousIdentity(interaction, flow, alias) {
     await ticketLog(claimLogEmbed(interaction, `anonima come ${shown}`));
   }
 
+  const relay = await ensureRelayThread(interaction.channel, interaction.member);
+
   const message = [
     `🛡️ You now reply as **${shown}**.`,
-    'Every message you type in this ticket is automatically republished under that name, no button needed.',
+    relay
+      ? `✅ **Write in ${relay} instead of this channel**: the user will not see you typing and will never see the original message. Everything you post there arrives here as **${shown}**.`
+      : 'Every message you type in this ticket is automatically republished under that name.',
+    'Typing directly in the ticket still works, but the user sees the typing indicator for a moment.',
     'Press 🛡️ Anonymous mode again to go back to your real name.',
   ].join('\n');
 
@@ -1848,6 +1910,36 @@ function isTicketChannel(channel) {
 
 client.on('messageCreate', async (message) => {
   if (!message.guild || message.author.bot || message.webhookId || message.system) return;
+
+  if (message.channel.isThread()) {
+    const parentId = await relayParentFor(message.channel.id);
+    if (!parentId) return;
+    if (!message.member || !isTicketStaff(message.member)) return;
+
+    const note = message.content.trim().startsWith('//');
+    if (note) {
+      await message.react('📝').catch(() => null);
+      return;
+    }
+
+    const ticket = await client.channels.fetch(parentId).catch(() => null);
+    if (!ticket) return;
+
+    const anonMap = await anonMapFor(parentId);
+    const relayName = staffDisplayName(anonMap.get(message.author.id) ?? null);
+    const relayed = await sendAsStaff(
+      ticket,
+      {
+        content: message.content?.trim() || undefined,
+        files: [...message.attachments.values()].map((a) => a.url),
+        allowedMentions: { parse: [], users: [...message.mentions.users.keys()].slice(0, 10) },
+      },
+      relayName,
+    );
+    await message.react(relayed ? '✅' : '⚠️').catch(() => null);
+    return;
+  }
+
   if (!isTicketChannel(message.channel)) return;
 
   const anonStaff = await anonMapFor(message.channel.id);
