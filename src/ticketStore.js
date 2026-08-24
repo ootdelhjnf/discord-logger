@@ -67,6 +67,11 @@ export async function toggleAnonStaff(channelId, userId, alias = null) {
   return enabled;
 }
 
+export async function listManagedChannels() {
+  const state = await load();
+  return [...new Set([...Object.keys(state.anonModes), ...Object.values(state.relays)])];
+}
+
 export async function setRelayThread(threadId, channelId) {
   const state = await load();
   if (state.relays[threadId] === channelId) return;

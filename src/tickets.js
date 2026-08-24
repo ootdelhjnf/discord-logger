@@ -482,6 +482,38 @@ export function claimAnnouncement(alias, user, anonymous) {
   return { embeds: [embed] };
 }
 
+export function staffToolsPanel(prefix, alias, active, ownerId, relay) {
+  const embed = new EmbedBuilder()
+    .setColor(active ? 0x22c55e : 0x5865f2)
+    .setTitle('🛠️ Staff tools')
+    .setDescription(
+      [
+        active
+          ? `You are currently replying as **${alias}** in this ticket.`
+          : `You are replying with **your own Discord name** in this ticket.`,
+        '',
+        `**🛡️ Anonymous mode** — turn the \`${prefix} / ...\` identity on or off`,
+        '**✉️ Staff reply** — send one single message under the support identity',
+        '**🙋 Claim** — take the ticket and pick how the user sees you',
+        relay ? `**Staff relay** — write in ${relay}, the user sees nothing` : '**Staff relay** — created as soon as you enable anonymous mode',
+      ].join('\n'),
+    )
+    .setFooter({ text: 'Only you can see this panel' });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('ticket_anon_toggle').setStyle(active ? ButtonStyle.Danger : ButtonStyle.Primary).setLabel(active ? 'Anonymous mode: ON' : 'Anonymous mode').setEmoji('🛡️'),
+    new ButtonBuilder().setCustomId('ticket_staff_reply').setStyle(ButtonStyle.Secondary).setLabel('Staff reply').setEmoji('✉️'),
+    new ButtonBuilder().setCustomId('ticket_claim').setStyle(ButtonStyle.Secondary).setLabel('Claim').setEmoji('🙋'),
+  );
+  if (ownerId) {
+    row.addComponents(
+      new ButtonBuilder().setCustomId(`ticket_history:${ownerId}:0`).setStyle(ButtonStyle.Secondary).setLabel('User tickets').setEmoji('📁'),
+    );
+  }
+
+  return { embeds: [embed], components: [row], ephemeral: true };
+}
+
 export function aliasChooser(flow, prefix, defaultAlias, memberName) {
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)

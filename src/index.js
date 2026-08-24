@@ -16,6 +16,7 @@ import {
   claimAnnouncement,
   aliasChooser,
   aliasModal,
+  staffToolsPanel,
   staffReplyModal,
   staffReplyLog,
   TICKET_TYPES,
@@ -33,6 +34,7 @@ import {
   getRelayParent,
   getRelayThread,
   clearRelays,
+  listManagedChannels,
 } from './ticketStore.js';
 import { startCodeStream, buildCodeMessage, expiredCodeMessage, redeemInstructions, buildStatsMessage, statsChannelName } from './codes.js';
 import {
@@ -126,6 +128,7 @@ const TICKET_STAFF_PREFIX = process.env.TICKET_STAFF_PREFIX || 'Support';
 const TICKET_RELAY_NAME = process.env.TICKET_RELAY_NAME || '🛡️ staff-relay';
 const relayParents = new Map();
 const relayThreads = new Map();
+const managedTicketChannels = new Set();
 const ticketWebhooks = new Map();
 const anonCache = new Map();
 const NO_REACTION_CHANNELS = (process.env.NO_REACTION_CHANNELS || '')
@@ -308,6 +311,9 @@ client.once('clientReady', async () => {
     return;
   }
   console.log(`Intent membri OK — ${members.size} membri in cache. Logger attivo.`);
+
+  await registerStaffCommand(guild);
+  await hydrateManagedTickets();
 
   if (KICK_SLUG) {
     await ensureAnnounceChannel(guild);
@@ -1316,6 +1322,7 @@ async function anonMapFor(channelId) {
 }
 
 async function setAnonymousMode(channelId, userId, enabled, alias = null) {
+  if (enabled) managedTicketChannels.add(channelId);
   await setAnonStaff(channelId, userId, enabled, alias);
   const map = await anonMapFor(channelId);
   if (enabled) map.set(userId, alias);
@@ -1483,6 +1490,27 @@ async function archiveTicket(interaction, resolved) {
 
   await ticketLog(embed, [transcript]);
   await channel.send(archivedMessage(interaction.user, resolved, ownerId));
+}
+
+async function registerStaffCommand(guild) {
+  const existing = await guild.commands.fetch().catch(() => null);
+  if (existing?.some((c) => c.name === 'staff-mode')) return;
+
+  await guild.commands
+    .create({
+      name: 'staff-mode',
+      description: 'Open the staff tools in this ticket (anonymous identity, claim, reply)',
+      defaultMemberPermissions: PermissionFlagsBits.ManageMessages,
+      dmPermission: false,
+    })
+    .then(() => console.log('comando /staff-mode registrato'))
+    .catch((err) => console.error('Registrazione /staff-mode fallita:', err.message));
+}
+
+async function hydrateManagedTickets() {
+  const channels = await listManagedChannels().catch(() => []);
+  for (const id of channels) managedTicketChannels.add(id);
+  if (channels.length) console.log(`ticket gestiti ripristinati: ${channels.length}`);
 }
 
 function claimLogEmbed(interaction, mode) {
@@ -1831,6 +1859,22 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    if (interaction.isChatInputCommand() && interaction.commandName === 'staff-mode') {
+      if (!isTicketStaff(interaction.member)) {
+        await interaction.reply({ content: 'Only staff can use this.', ephemeral: true });
+        return;
+      }
+      const anonMap = await anonMapFor(interaction.channel.id);
+      const active = anonMap.has(interaction.user.id);
+      const shown = staffDisplayName(anonMap.get(interaction.user.id) ?? null);
+      const ownerId = interaction.channel.topic?.match(/owner:(\d+)/)?.[1] ?? null;
+      const threadId = await relayThreadFor(interaction.channel.id);
+      const relay = threadId ? `<#${threadId}>` : null;
+      managedTicketChannels.add(interaction.channel.id);
+      await interaction.reply(staffToolsPanel(TICKET_STAFF_PREFIX, shown, active, ownerId, relay));
+      return;
+    }
+
     if (interaction.isChatInputCommand() && interaction.commandName === 'members') {
       await interaction.deferReply({ ephemeral: true });
       const payload = await membersPage(interaction.guild, 0);
@@ -1944,6 +1988,7 @@ createServer(async (req, res) => {
 
 function isTicketChannel(channel) {
   if (!channel || channel.type !== ChannelType.GuildText) return false;
+  if (managedTicketChannels.has(channel.id)) return true;
   if (channel.topic?.includes('owner:')) return true;
   return [TICKET_CONFIG.categoryId, TICKET_CONFIG.archiveCategoryId].filter(Boolean).includes(channel.parentId);
 }
