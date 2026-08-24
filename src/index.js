@@ -18,7 +18,16 @@ import {
   staffReplyLog,
   TICKET_TYPES,
 } from './tickets.js';
-import { getTicket, markClosed, markDeleted, updateTicket } from './ticketStore.js';
+import {
+  getTicket,
+  markClosed,
+  markDeleted,
+  updateTicket,
+  getAnonStaff,
+  toggleAnonStaff,
+  setAnonStaff,
+  clearAnonStaff,
+} from './ticketStore.js';
 import { startCodeStream, buildCodeMessage, expiredCodeMessage, redeemInstructions, buildStatsMessage, statsChannelName } from './codes.js';
 import {
   getCodesState,
@@ -108,6 +117,7 @@ const TICKET_BANNER = 'server-banner.gif';
 const TICKET_STAFF_ALIAS = process.env.TICKET_STAFF_ALIAS || 'Support Team';
 const TICKET_STAFF_AVATAR = process.env.TICKET_STAFF_AVATAR;
 const ticketWebhooks = new Map();
+const anonCache = new Map();
 const NO_REACTION_CHANNELS = (process.env.NO_REACTION_CHANNELS || '')
   .split(',')
   .map((id) => id.trim())
@@ -127,6 +137,8 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessageReactions,
   ],
   partials: [Partials.GuildMember, Partials.User, Partials.Message, Partials.Reaction, Partials.Channel],
@@ -1282,6 +1294,29 @@ async function getTicketWebhook(channel) {
   return hook;
 }
 
+async function anonSetFor(channelId) {
+  if (anonCache.has(channelId)) return anonCache.get(channelId);
+  const set = new Set(await getAnonStaff(channelId));
+  anonCache.set(channelId, set);
+  return set;
+}
+
+async function setAnonymousMode(channelId, userId, enabled) {
+  await setAnonStaff(channelId, userId, enabled);
+  const set = await anonSetFor(channelId);
+  if (enabled) set.add(userId);
+  else set.delete(userId);
+  return enabled;
+}
+
+async function switchAnonymousMode(channelId, userId) {
+  const enabled = await toggleAnonStaff(channelId, userId);
+  const set = await anonSetFor(channelId);
+  if (enabled) set.add(userId);
+  else set.delete(userId);
+  return enabled;
+}
+
 async function sendAsStaff(channel, payload) {
   const hook = await getTicketWebhook(channel);
   if (!hook) return channel.send(payload).catch(() => null);
@@ -1318,6 +1353,9 @@ async function archiveTicket(interaction, resolved) {
     await channel.permissionOverwrites.edit(ownerId, { SendMessages: false, ViewChannel: true }).catch(() => null);
   }
   await channel.setName(`closed-${channel.name.replace(/^ticket-/, '')}`.slice(0, 100)).catch(() => null);
+
+  anonCache.delete(channel.id);
+  await clearAnonStaff(channel.id);
 
   await markClosed(channel.id, {
     resolved,
@@ -1441,12 +1479,13 @@ async function handleTicketInteraction(interaction) {
 
     await interaction.update({
       content: anonymous
-        ? `Claimed as **${TICKET_STAFF_ALIAS}**. Use **Staff reply** to answer without showing your name.`
+        ? `Claimed as **${TICKET_STAFF_ALIAS}**. From now on **every message you type here** is republished under that identity, no button needed. Use 🛡️ Anonymous mode to turn it off.`
         : 'Claimed with your name. Just type in the channel as usual.',
       embeds: [],
       components: [],
     });
 
+    await setAnonymousMode(interaction.channel.id, interaction.user.id, anonymous);
     await updateTicket(interaction.channel.id, {
       claimedBy: interaction.user.id,
       claimedByTag: interaction.user.tag,
@@ -1463,6 +1502,21 @@ async function handleTicketInteraction(interaction) {
       )
       .setTimestamp(new Date());
     await ticketLog(embed);
+    return true;
+  }
+
+  if (interaction.isButton() && interaction.customId === 'ticket_anon_toggle') {
+    if (!isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'Only staff can use this.', ephemeral: true });
+      return true;
+    }
+    const enabled = await switchAnonymousMode(interaction.channel.id, interaction.user.id);
+    await interaction.reply({
+      content: enabled
+        ? `🛡️ Anonymous mode **ON**. Everything you write in this ticket is republished as **${TICKET_STAFF_ALIAS}**.`
+        : '🙋 Anonymous mode **OFF**. Your messages now show your real Discord name.',
+      ephemeral: true,
+    });
     return true;
   }
 
@@ -1713,6 +1767,44 @@ createServer(async (req, res) => {
     }),
   );
 }).listen(PORT, () => console.log(`Keep-alive HTTP in ascolto sulla porta ${PORT}`));
+
+function isTicketChannel(channel) {
+  if (!channel || channel.type !== ChannelType.GuildText) return false;
+  if (channel.topic?.includes('owner:')) return true;
+  return [TICKET_CONFIG.categoryId, TICKET_CONFIG.archiveCategoryId].filter(Boolean).includes(channel.parentId);
+}
+
+client.on('messageCreate', async (message) => {
+  if (!message.guild || message.author.bot || message.webhookId || message.system) return;
+  if (!isTicketChannel(message.channel)) return;
+
+  const anonStaff = await anonSetFor(message.channel.id);
+  if (!anonStaff.has(message.author.id)) return;
+  if (!message.member || !isTicketStaff(message.member)) return;
+
+  const content = message.content?.trim();
+  const files = [...message.attachments.values()].map((a) => a.url);
+  if (!content && !files.length) return;
+
+  await message.delete().catch((err) => console.error('Mirror anonimo: delete fallito:', err.message));
+  const sent = await sendAsStaff(message.channel, {
+    content: content || undefined,
+    files,
+    allowedMentions: { parse: [], users: [...message.mentions.users.keys()].slice(0, 10) },
+  });
+  if (!sent) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(0x8b5cf6)
+    .setTitle('🛡️ Messaggio staff anonimizzato')
+    .addFields(
+      { name: 'Autore reale', value: `${message.author} (${message.author.tag})`, inline: true },
+      { name: 'Canale', value: `${message.channel}`, inline: true },
+      { name: 'Testo', value: (content || '(solo allegati)').slice(0, 1024) },
+    )
+    .setTimestamp(new Date());
+  await ticketLog(embed);
+});
 
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot) return;

@@ -394,7 +394,8 @@ export async function createTicket(interaction, config, answers, typeKey) {
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('ticket_close').setStyle(ButtonStyle.Danger).setLabel('Close ticket').setEmoji('🔒'),
     new ButtonBuilder().setCustomId('ticket_claim').setStyle(ButtonStyle.Secondary).setLabel('Claim').setEmoji('🙋'),
-    new ButtonBuilder().setCustomId('ticket_staff_reply').setStyle(ButtonStyle.Primary).setLabel('Staff reply').setEmoji('🛡️'),
+    new ButtonBuilder().setCustomId('ticket_anon_toggle').setStyle(ButtonStyle.Primary).setLabel('Anonymous mode').setEmoji('🛡️'),
+    new ButtonBuilder().setCustomId('ticket_staff_reply').setStyle(ButtonStyle.Secondary).setLabel('Staff reply').setEmoji('✉️'),
     new ButtonBuilder().setCustomId(`ticket_history:${user.id}:0`).setStyle(ButtonStyle.Secondary).setLabel('Past tickets').setEmoji('📁'),
   );
 
