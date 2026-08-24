@@ -12,9 +12,13 @@ import {
   categoryChooser,
   historyMessage,
   ticketDetailMessage,
+  claimChooser,
+  claimAnnouncement,
+  staffReplyModal,
+  staffReplyLog,
   TICKET_TYPES,
 } from './tickets.js';
-import { getTicket, markClosed, markDeleted } from './ticketStore.js';
+import { getTicket, markClosed, markDeleted, updateTicket } from './ticketStore.js';
 import { startCodeStream, buildCodeMessage, expiredCodeMessage, redeemInstructions, buildStatsMessage, statsChannelName } from './codes.js';
 import {
   getCodesState,
@@ -101,6 +105,9 @@ const TICKET_CONFIG = {
   staffRoles: (process.env.TICKET_STAFF_ROLES || '').split(',').map((s) => s.trim()).filter(Boolean),
 };
 const TICKET_BANNER = 'server-banner.gif';
+const TICKET_STAFF_ALIAS = process.env.TICKET_STAFF_ALIAS || 'Support Team';
+const TICKET_STAFF_AVATAR = process.env.TICKET_STAFF_AVATAR;
+const ticketWebhooks = new Map();
 const NO_REACTION_CHANNELS = (process.env.NO_REACTION_CHANNELS || '')
   .split(',')
   .map((id) => id.trim())
@@ -1244,6 +1251,53 @@ function isTicketStaff(member) {
     || TICKET_CONFIG.staffRoles.some((id) => member.roles.cache.has(id));
 }
 
+function staffAvatar(guild) {
+  return TICKET_STAFF_AVATAR || guild.iconURL({ extension: 'png', size: 256 }) || undefined;
+}
+
+async function getTicketWebhook(channel) {
+  const cached = ticketWebhooks.get(channel.id);
+  if (cached) return cached;
+
+  const hooks = await channel.fetchWebhooks().catch((err) => {
+    console.error('Webhook ticket non leggibili:', err.message);
+    return null;
+  });
+  let hook = hooks?.find((h) => h.owner?.id === client.user.id && h.token) ?? null;
+
+  if (!hook) {
+    hook = await channel
+      .createWebhook({
+        name: TICKET_STAFF_ALIAS,
+        avatar: staffAvatar(channel.guild),
+        reason: 'Identita staff per le risposte anonime',
+      })
+      .catch((err) => {
+        console.error('Creazione webhook ticket fallita:', err.message);
+        return null;
+      });
+  }
+
+  if (hook) ticketWebhooks.set(channel.id, hook);
+  return hook;
+}
+
+async function sendAsStaff(channel, payload) {
+  const hook = await getTicketWebhook(channel);
+  if (!hook) return channel.send(payload).catch(() => null);
+  return hook
+    .send({
+      ...payload,
+      username: TICKET_STAFF_ALIAS.slice(0, 80),
+      avatarURL: staffAvatar(channel.guild),
+      withComponents: true,
+    })
+    .catch((err) => {
+      console.error('Invio come staff fallito:', err.message);
+      return channel.send(payload).catch(() => null);
+    });
+}
+
 async function ticketLog(embed, files = []) {
   if (!TICKET_CONFIG.logChannelId) return;
   const channel = await client.channels.fetch(TICKET_CONFIG.logChannelId).catch(() => null);
@@ -1370,7 +1424,69 @@ async function handleTicketInteraction(interaction) {
       await interaction.reply({ content: 'Only staff can claim a ticket.', ephemeral: true });
       return true;
     }
-    await interaction.reply({ content: `🙋 ${interaction.user} is handling this ticket.` });
+    await interaction.reply(claimChooser(TICKET_STAFF_ALIAS));
+    return true;
+  }
+
+  if (interaction.isButton() && interaction.customId.startsWith('ticket_claim:')) {
+    if (!isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'Only staff can claim a ticket.', ephemeral: true });
+      return true;
+    }
+    const anonymous = interaction.customId.split(':')[1] === 'anon';
+    const payload = claimAnnouncement(TICKET_STAFF_ALIAS, interaction.user, anonymous);
+
+    if (anonymous) await sendAsStaff(interaction.channel, payload);
+    else await interaction.channel.send(payload);
+
+    await interaction.update({
+      content: anonymous
+        ? `Claimed as **${TICKET_STAFF_ALIAS}**. Use **Staff reply** to answer without showing your name.`
+        : 'Claimed with your name. Just type in the channel as usual.',
+      embeds: [],
+      components: [],
+    });
+
+    await updateTicket(interaction.channel.id, {
+      claimedBy: interaction.user.id,
+      claimedByTag: interaction.user.tag,
+      claimAnonymous: anonymous,
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor(0x22c55e)
+      .setTitle('🙋 Ticket preso in carico')
+      .addFields(
+        { name: 'Staff', value: `${interaction.user}`, inline: true },
+        { name: 'Modalita', value: anonymous ? `anonima (${TICKET_STAFF_ALIAS})` : 'nome reale', inline: true },
+        { name: 'Canale', value: `${interaction.channel}`, inline: true },
+      )
+      .setTimestamp(new Date());
+    await ticketLog(embed);
+    return true;
+  }
+
+  if (interaction.isButton() && interaction.customId === 'ticket_staff_reply') {
+    if (!isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'Only staff can use this.', ephemeral: true });
+      return true;
+    }
+    await interaction.showModal(staffReplyModal(TICKET_STAFF_ALIAS));
+    return true;
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId === 'ticket_staff_reply_modal') {
+    if (!isTicketStaff(interaction.member)) {
+      await interaction.reply({ content: 'Only staff can use this.', ephemeral: true });
+      return true;
+    }
+    const text = interaction.fields.getTextInputValue('message');
+    await interaction.deferReply({ ephemeral: true });
+    const sent = await sendAsStaff(interaction.channel, { content: text, allowedMentions: { parse: [] } });
+    await interaction.editReply({
+      content: sent ? `Sent as **${TICKET_STAFF_ALIAS}**.` : 'Could not send the message.',
+    });
+    await ticketLog(staffReplyLog(TICKET_STAFF_ALIAS, interaction.user, interaction.channel, text));
     return true;
   }
 

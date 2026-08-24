@@ -394,6 +394,7 @@ export async function createTicket(interaction, config, answers, typeKey) {
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('ticket_close').setStyle(ButtonStyle.Danger).setLabel('Close ticket').setEmoji('🔒'),
     new ButtonBuilder().setCustomId('ticket_claim').setStyle(ButtonStyle.Secondary).setLabel('Claim').setEmoji('🙋'),
+    new ButtonBuilder().setCustomId('ticket_staff_reply').setStyle(ButtonStyle.Primary).setLabel('Staff reply').setEmoji('🛡️'),
     new ButtonBuilder().setCustomId(`ticket_history:${user.id}:0`).setStyle(ButtonStyle.Secondary).setLabel('Past tickets').setEmoji('📁'),
   );
 
@@ -444,6 +445,70 @@ export async function buildTranscript(channel) {
   return new AttachmentBuilder(Buffer.from(header + lines.join('\n'), 'utf8'), {
     name: `transcript-${channel.name}-${channel.id}.txt`,
   });
+}
+
+export function claimChooser(alias) {
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('How do you want to claim this ticket?')
+    .setDescription(
+      [
+        `**${alias}** — the user only sees the support team, your name stays hidden.`,
+        '**Your name** — the user sees exactly who is handling the ticket.',
+        '',
+        'Either way the staff log records who claimed it.',
+      ].join('\n'),
+    );
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('ticket_claim:anon').setStyle(ButtonStyle.Primary).setLabel(`Claim as ${alias}`.slice(0, 80)).setEmoji('🛡️'),
+    new ButtonBuilder().setCustomId('ticket_claim:named').setStyle(ButtonStyle.Secondary).setLabel('Claim with my name').setEmoji('🙋'),
+  );
+
+  return { embeds: [embed], components: [row], ephemeral: true };
+}
+
+export function claimAnnouncement(alias, user, anonymous) {
+  const embed = new EmbedBuilder()
+    .setColor(0x22c55e)
+    .setTitle('🙋 Ticket claimed')
+    .setDescription(
+      anonymous
+        ? `A member of the **${alias}** is now handling this ticket. Please keep the conversation in this channel.`
+        : `${user} is now handling this ticket. Please keep the conversation in this channel.`,
+    )
+    .setTimestamp(new Date());
+  return { embeds: [embed] };
+}
+
+export function staffReplyModal(alias) {
+  const modal = new ModalBuilder()
+    .setCustomId('ticket_staff_reply_modal')
+    .setTitle(`Reply as ${alias}`.slice(0, 45));
+
+  const message = new TextInputBuilder()
+    .setCustomId('message')
+    .setLabel('Message sent to the user')
+    .setPlaceholder('Write the reply exactly as the user will read it')
+    .setStyle(TextInputStyle.Paragraph)
+    .setMinLength(2)
+    .setMaxLength(1800)
+    .setRequired(true);
+
+  return modal.addComponents(new ActionRowBuilder().addComponents(message));
+}
+
+export function staffReplyLog(alias, user, channel, text) {
+  return new EmbedBuilder()
+    .setColor(0x8b5cf6)
+    .setTitle('🛡️ Risposta staff anonima')
+    .addFields(
+      { name: 'Autore reale', value: `${user} (${user.tag})`, inline: true },
+      { name: 'Mostrato come', value: alias, inline: true },
+      { name: 'Canale', value: `${channel}`, inline: true },
+      { name: 'Messaggio', value: text.slice(0, 1024) },
+    )
+    .setTimestamp(new Date());
 }
 
 export function closeConfirmMessage() {
