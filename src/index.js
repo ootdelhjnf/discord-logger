@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { createVerification, handleVerify, pendingCount } from './verify.js';
 import { buildLiveMessage, buildLiveAnnouncement } from './live.js';
 import { readLiveState, writeLiveState } from './liveState.js';
+import { fetchOfficialChannel, kickApiConfigured } from './kickApi.js';
 import {
   buildPanel,
   buildModal,
@@ -1087,6 +1088,12 @@ function extractFollowers(data) {
 }
 
 async function fetchKickChannel() {
+  if (kickApiConfigured()) {
+    const state = await readLiveState();
+    const result = await fetchOfficialChannel(KICK_SLUG, kickState.followers ?? state.followers ?? null);
+    if (result.followers !== null && result.followers !== state.followers) await writeLiveState({ followers: result.followers });
+    return result;
+  }
   const errors = [];
   for (const build of KICK_ENDPOINTS) {
     const url = build(KICK_SLUG);
@@ -1133,6 +1140,10 @@ async function pollKick() {
   await announceLive(raw);
 
   const live = Boolean(raw.livestream ?? raw.stream?.is_live);
+  if (typeof followers !== 'number') {
+    kickState = { ...kickState, live, updatedAt: new Date().toISOString() };
+    return;
+  }
   const name = `${live ? '🔴' : '🟢'}・𝗞𝗜𝗖𝗞: ${followers.toLocaleString('en-US')}`;
 
   const applied = kickState.applied;

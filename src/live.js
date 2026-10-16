@@ -89,7 +89,7 @@ export function buildLiveMessage(data, slug) {
   const url = `https://kick.com/${slug}`;
   const live = data.livestream;
   const isLive = Boolean(live);
-  const followers = Number(data.followers_count ?? 0).toLocaleString('en-US');
+  const followers = typeof data.followers_count === 'number' ? data.followers_count.toLocaleString('en-US') : '—';
   const avatar = data.user?.profile_pic ?? null;
   const displayName = data.user?.username ?? slug;
 
