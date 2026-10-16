@@ -20,10 +20,9 @@ import {
   staffToolsPanel,
   staffReplyModal,
   staffReplyLog,
-  findOpenTicket,
   TICKET_TYPES,
 } from './tickets.js';
-import { createSiteTicketHandler } from './siteTickets.js';
+import { createSiteHandler } from './siteTickets.js';
 import {
   getTicket,
   markClosed,
@@ -160,14 +159,13 @@ const client = new Client({
   partials: [Partials.GuildMember, Partials.User, Partials.Message, Partials.Reaction, Partials.Channel],
 });
 
-const handleSiteTicket = createSiteTicketHandler({
+const handleSite = createSiteHandler({
   client,
   guildId: process.env.GUILD_ID,
   secret: process.env.SITE_TICKET_SECRET || '',
   config: TICKET_CONFIG,
   types: TICKET_TYPES,
   createTicket,
-  findOpenTicket,
 });
 
 async function getLogChannel() {
@@ -1970,8 +1968,8 @@ let lastPingAt = null;
 
 createServer(async (req, res) => {
   const pathname = new URL(req.url, 'http://localhost').pathname;
-  if (pathname === '/site/ticket') {
-    await handleSiteTicket(req, res).catch(() => {
+  if (pathname.startsWith('/site/')) {
+    await handleSite(req, res, pathname).catch(() => {
       if (res.headersSent) return res.end();
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end('{"error":"internal"}');

@@ -1,9 +1,14 @@
 import crypto from 'node:crypto';
+import { ChannelType, EmbedBuilder } from 'discord.js';
 
 const BODY_LIMIT = 16 * 1024;
 const MAX_SKEW_MS = 5 * 60 * 1000;
+const STATE_CACHE_MS = 3000;
+const STAFF_SETTLE_MS = 6000;
+const SITE_FOOTER = 'Sent from cousik.com';
 const LIMITS = { subject: [6, 100], details: [30, 1000], casino: [10, 400], account: [0, 80] };
 const seenSignatures = new Map();
+const stateCache = new Map();
 
 function reply(res, status, payload) {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -50,8 +55,116 @@ function cleanAnswers(types, type, answers) {
   return result;
 }
 
-export function createSiteTicketHandler({ client, guildId, secret, config, types, createTicket, findOpenTicket }) {
-  return async function handleSiteTicket(req, res) {
+function readableContent(text) {
+  return String(text ?? '')
+    .replace(/<@&\d+>/g, '@staff')
+    .replace(/<@!?\d+>/g, '@user')
+    .replace(/<#\d+>/g, '#channel')
+    .replace(/<a?:(\w+):\d+>/g, ':$1:')
+    .trim();
+}
+
+function attachmentsOf(message) {
+  return [...message.attachments.values()].slice(0, 4).map((file) => ({ name: file.name, url: file.url, image: /^image\//.test(file.contentType ?? '') }));
+}
+
+function toSiteMessage(message, ownerId, botId) {
+  const at = message.createdTimestamp;
+  if (message.webhookId) {
+    const content = readableContent(message.content);
+    if (!content && !message.attachments.size) return null;
+    return { id: message.id, kind: 'staff', author: message.author.username, content, attachments: attachmentsOf(message), at };
+  }
+  if (message.author.id === botId) {
+    const embed = message.embeds[0];
+    if (embed?.footer?.text === SITE_FOOTER) return { id: message.id, kind: 'mine', author: 'You', content: embed.description ?? '', attachments: [], at };
+    if (embed?.title && /ticket claimed/i.test(embed.title)) return { id: message.id, kind: 'system', content: 'A staff member is now handling your ticket.', at };
+    return null;
+  }
+  if (message.author.bot) return null;
+  const content = readableContent(message.content);
+  if (!content && !message.attachments.size) return null;
+  if (message.author.id === ownerId) return { id: message.id, kind: 'mine', author: 'You', content, attachments: attachmentsOf(message), at };
+  if (Date.now() - at < STAFF_SETTLE_MS) return null;
+  return { id: message.id, kind: 'staff', author: message.member?.displayName ?? message.author.globalName ?? message.author.username, content, attachments: attachmentsOf(message), at };
+}
+
+export function createSiteHandler({ client, guildId, secret, config, types, createTicket }) {
+  const guild = () => client.guilds.cache.get(guildId) ?? null;
+
+  const openTicketOf = (discordId) =>
+    guild()?.channels.cache.find(
+      (channel) => channel.type === ChannelType.GuildText && channel.parentId === config.categoryId && channel.topic?.includes(`owner:${discordId}`),
+    ) ?? null;
+
+  const ticketState = async (channel, ownerId) => {
+    const cached = stateCache.get(channel.id);
+    if (cached && Date.now() - cached.at < STATE_CACHE_MS) return cached.value;
+    const fetched = await channel.messages.fetch({ limit: 50 });
+    const messages = [...fetched.values()]
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+      .map((message) => toSiteMessage(message, ownerId, client.user.id))
+      .filter(Boolean);
+    const value = { guildId: channel.guildId, channelId: channel.id, name: channel.name, messages };
+    stateCache.set(channel.id, { at: Date.now(), value });
+    return value;
+  };
+
+  const create = async (res, payload, discordId) => {
+    const answers = cleanAnswers(types, String(payload.type ?? ''), payload.answers);
+    if (!answers) return reply(res, 400, { error: 'invalid' });
+    const server = guild();
+    if (!server) return reply(res, 503, { error: 'guild' });
+
+    const existing = openTicketOf(discordId);
+    if (existing) return reply(res, 409, { error: 'open_ticket', guildId: server.id, channelId: existing.id, name: existing.name });
+
+    let member = await server.members.fetch(discordId).catch(() => null);
+    if (!member && payload.accessToken) {
+      member = await server.members.add(discordId, { accessToken: String(payload.accessToken) }).catch((err) => {
+        console.error('[site-ticket] aggiunta al server fallita:', err.message);
+        return null;
+      });
+    }
+    if (!member) return reply(res, 403, { error: 'join_failed' });
+
+    const result = await createTicket({ guild: server, user: member.user }, config, answers, payload.type);
+    if (!result.ok) {
+      const open = openTicketOf(discordId);
+      return reply(res, 409, { error: 'open_ticket', guildId: server.id, channelId: open?.id ?? null, name: open?.name ?? null });
+    }
+    await result.channel
+      .send({ content: '🌐 Ticket opened from **cousik.com**. The user can read and reply from the website too.', allowedMentions: { parse: [] } })
+      .catch(() => null);
+    console.log(`[site-ticket] ${member.user.tag} -> #${result.channel.name}`);
+    return reply(res, 201, { guildId: server.id, channelId: result.channel.id, name: result.channel.name });
+  };
+
+  const state = async (res, discordId) => {
+    const channel = openTicketOf(discordId);
+    if (!channel) return reply(res, 200, { ticket: null });
+    return reply(res, 200, { ticket: await ticketState(channel, discordId) });
+  };
+
+  const message = async (res, payload, discordId) => {
+    const content = String(payload.content ?? '').replace(/\r\n/g, '\n').trim();
+    if (content.length < 1 || content.length > 1000) return reply(res, 400, { error: 'invalid' });
+    const channel = openTicketOf(discordId);
+    if (!channel) return reply(res, 404, { error: 'no_ticket' });
+    const name = String(payload.displayName ?? '').slice(0, 80) || 'User';
+    const avatar = /^https:\/\/cdn\.discordapp\.com\//.test(String(payload.avatar ?? '')) ? payload.avatar : undefined;
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setAuthor({ name, iconURL: avatar })
+      .setDescription(content)
+      .setFooter({ text: SITE_FOOTER })
+      .setTimestamp(new Date());
+    await channel.send({ content: `<@${discordId}>`, embeds: [embed], allowedMentions: { parse: [] } });
+    stateCache.delete(channel.id);
+    return reply(res, 201, { ok: true });
+  };
+
+  return async function handleSite(req, res, pathname) {
     if (req.method !== 'POST') return reply(res, 405, { error: 'method' });
     let body;
     try {
@@ -71,36 +184,16 @@ export function createSiteTicketHandler({ client, guildId, secret, config, types
       return reply(res, 400, { error: 'json' });
     }
     const discordId = String(payload.discordId ?? '');
-    const answers = cleanAnswers(types, String(payload.type ?? ''), payload.answers);
-    if (!/^\d{15,22}$/.test(discordId) || !answers) return reply(res, 400, { error: 'invalid' });
-
-    const guild = client.guilds.cache.get(guildId);
-    if (!guild) return reply(res, 503, { error: 'guild' });
-
-    const existing = await findOpenTicket(guild, discordId, config.categoryId).catch(() => null);
-    if (existing) return reply(res, 409, { error: 'open_ticket', guildId: guild.id, channelId: existing.id });
-
-    let member = await guild.members.fetch(discordId).catch(() => null);
-    if (!member && payload.accessToken) {
-      member = await guild.members.add(discordId, { accessToken: String(payload.accessToken) }).catch((err) => {
-        console.error('[site-ticket] aggiunta al server fallita:', err.message);
-        return null;
-      });
-    }
-    if (!member) return reply(res, 403, { error: 'join_failed' });
+    if (!/^\d{15,22}$/.test(discordId)) return reply(res, 400, { error: 'invalid' });
 
     try {
-      const result = await createTicket({ guild, user: member.user }, config, answers, payload.type);
-      if (!result.ok) {
-        const open = await findOpenTicket(guild, discordId, config.categoryId).catch(() => null);
-        return reply(res, 409, { error: 'open_ticket', guildId: guild.id, channelId: open?.id ?? null });
-      }
-      await result.channel.send({ content: '🌐 Ticket opened from **cousik.com**.', allowedMentions: { parse: [] } }).catch(() => null);
-      console.log(`[site-ticket] ${member.user.tag} -> #${result.channel.name}`);
-      return reply(res, 201, { guildId: guild.id, channelId: result.channel.id });
+      if (pathname === '/site/ticket') return await create(res, payload, discordId);
+      if (pathname === '/site/ticket/state') return await state(res, discordId);
+      if (pathname === '/site/ticket/message') return await message(res, payload, discordId);
+      return reply(res, 404, { error: 'not_found' });
     } catch (err) {
-      console.error('[site-ticket] creazione fallita:', err.message);
-      return reply(res, 500, { error: 'create_failed' });
+      console.error(`[site-ticket] ${pathname} fallito:`, err.message);
+      return reply(res, 500, { error: 'failed' });
     }
   };
 }
